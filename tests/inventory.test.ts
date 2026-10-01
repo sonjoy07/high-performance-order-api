@@ -2,14 +2,19 @@ import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import request from 'supertest';
 import { app } from '../src/app';
 import { prisma } from '../src/config/prisma';
+import { createTestAdmin } from './helpers/auth.helper';
 
 describe('Inventory APIs (/api/v1/inventory)', () => {
   let testCategoryId: string;
   let testProductId: string;
   let noInventoryProductId: string;
   let concurrencyProductId: string;
+  let adminToken: string;
 
   beforeAll(async () => {
+    const admin = await createTestAdmin();
+    adminToken = admin.accessToken;
+
     // 1. Create a category for tests
     const category = await prisma.category.create({
       data: {
@@ -71,7 +76,6 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
   });
 
   afterAll(async () => {
-    // Clean up test data in reverse dependency order
     const productIds = [testProductId, noInventoryProductId, concurrencyProductId].filter(Boolean);
 
     await prisma.inventoryMovement.deleteMany({
@@ -94,7 +98,9 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
 
   describe('GET /api/v1/inventory/:productId', () => {
     it('should return current inventory and computed availableQuantity', async () => {
-      const response = await request(app).get(`/api/v1/inventory/${testProductId}`);
+      const response = await request(app)
+        .get(`/api/v1/inventory/${testProductId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -107,9 +113,9 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
     });
 
     it('should return 404 PRODUCT_NOT_FOUND when product does not exist', async () => {
-      const response = await request(app).get(
-        '/api/v1/inventory/00000000-0000-0000-0000-000000000000'
-      );
+      const response = await request(app)
+        .get('/api/v1/inventory/00000000-0000-0000-0000-000000000000')
+        .set('Authorization', `Bearer ${adminToken}`);
 
       expect(response.status).toBe(404);
       expect(response.body.success).toBe(false);
@@ -117,7 +123,9 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
     });
 
     it('should return 404 INVENTORY_NOT_FOUND when inventory record is missing for product', async () => {
-      const response = await request(app).get(`/api/v1/inventory/${noInventoryProductId}`);
+      const response = await request(app)
+        .get(`/api/v1/inventory/${noInventoryProductId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
 
       expect(response.status).toBe(404);
       expect(response.body.success).toBe(false);
@@ -127,11 +135,14 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
 
   describe('POST /api/v1/inventory/:productId/adjust - STOCK_IN', () => {
     it('should increase stock and record STOCK_IN movement', async () => {
-      const response = await request(app).post(`/api/v1/inventory/${testProductId}/adjust`).send({
-        quantity: 25,
-        type: 'STOCK_IN',
-        reason: 'Supplier restock batch #401',
-      });
+      const response = await request(app)
+        .post(`/api/v1/inventory/${testProductId}/adjust`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          quantity: 25,
+          type: 'STOCK_IN',
+          reason: 'Supplier restock batch #401',
+        });
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -154,11 +165,14 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
 
   describe('POST /api/v1/inventory/:productId/adjust - STOCK_OUT', () => {
     it('should decrease stock and record STOCK_OUT movement when quantity <= available', async () => {
-      const response = await request(app).post(`/api/v1/inventory/${testProductId}/adjust`).send({
-        quantity: 15,
-        type: 'STOCK_OUT',
-        reason: 'Damaged stock write-off',
-      });
+      const response = await request(app)
+        .post(`/api/v1/inventory/${testProductId}/adjust`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          quantity: 15,
+          type: 'STOCK_OUT',
+          reason: 'Damaged stock write-off',
+        });
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -173,11 +187,14 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
     it('should return 409 INSUFFICIENT_STOCK when trying to stock-out more than availableQuantity', async () => {
       // Currently: quantity = 110, reserved = 20, available = 90.
       // Trying to stock out 95 units should be rejected even though physical quantity (110) > 95!
-      const response = await request(app).post(`/api/v1/inventory/${testProductId}/adjust`).send({
-        quantity: 95,
-        type: 'STOCK_OUT',
-        reason: 'Bulk removal',
-      });
+      const response = await request(app)
+        .post(`/api/v1/inventory/${testProductId}/adjust`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          quantity: 95,
+          type: 'STOCK_OUT',
+          reason: 'Bulk removal',
+        });
 
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
@@ -195,11 +212,14 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
     it('should adjust physical stock to target count when target >= reservedQuantity', async () => {
       // Current: quantity = 110, reserved = 20.
       // Setting new physical count to 80.
-      const response = await request(app).post(`/api/v1/inventory/${testProductId}/adjust`).send({
-        quantity: 80,
-        type: 'ADJUSTMENT',
-        reason: 'End-of-month cycle count',
-      });
+      const response = await request(app)
+        .post(`/api/v1/inventory/${testProductId}/adjust`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          quantity: 80,
+          type: 'ADJUSTMENT',
+          reason: 'End-of-month cycle count',
+        });
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -221,11 +241,14 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
 
     it('should return 409 INVENTORY_BELOW_RESERVED_STOCK when target count < reservedQuantity', async () => {
       // Reserved is 20. Trying to set total physical count to 15.
-      const response = await request(app).post(`/api/v1/inventory/${testProductId}/adjust`).send({
-        quantity: 15,
-        type: 'ADJUSTMENT',
-        reason: 'Erroneous count',
-      });
+      const response = await request(app)
+        .post(`/api/v1/inventory/${testProductId}/adjust`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          quantity: 15,
+          type: 'ADJUSTMENT',
+          reason: 'Erroneous count',
+        });
 
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
@@ -241,10 +264,13 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
 
   describe('POST /api/v1/inventory/:productId/adjust - Validation Rules', () => {
     it('should return 400 when quantity is zero or negative', async () => {
-      const response = await request(app).post(`/api/v1/inventory/${testProductId}/adjust`).send({
-        quantity: 0,
-        type: 'STOCK_IN',
-      });
+      const response = await request(app)
+        .post(`/api/v1/inventory/${testProductId}/adjust`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          quantity: 0,
+          type: 'STOCK_IN',
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -252,10 +278,13 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
     });
 
     it('should return 400 when type is invalid (e.g. RESERVATION)', async () => {
-      const response = await request(app).post(`/api/v1/inventory/${testProductId}/adjust`).send({
-        quantity: 10,
-        type: 'RESERVATION',
-      });
+      const response = await request(app)
+        .post(`/api/v1/inventory/${testProductId}/adjust`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          quantity: 10,
+          type: 'RESERVATION',
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -267,6 +296,7 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
     it('should return paginated movement history', async () => {
       const response = await request(app)
         .get(`/api/v1/inventory/${testProductId}/movements`)
+        .set('Authorization', `Bearer ${adminToken}`)
         .query({ page: 1, limit: 10 });
 
       expect(response.status).toBe(200);
@@ -280,6 +310,7 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
     it('should filter movements by movement type', async () => {
       const response = await request(app)
         .get(`/api/v1/inventory/${testProductId}/movements`)
+        .set('Authorization', `Bearer ${adminToken}`)
         .query({ type: 'STOCK_IN' });
 
       expect(response.status).toBe(200);
@@ -295,6 +326,7 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
 
       const response = await request(app)
         .get(`/api/v1/inventory/${testProductId}/movements`)
+        .set('Authorization', `Bearer ${adminToken}`)
         .query({ from: pastDate, to: futureDate });
 
       expect(response.status).toBe(200);
@@ -314,6 +346,7 @@ describe('Inventory APIs (/api/v1/inventory)', () => {
       const requests = Array.from({ length: 10 }, (_, i) =>
         request(app)
           .post(`/api/v1/inventory/${concurrencyProductId}/adjust`)
+          .set('Authorization', `Bearer ${adminToken}`)
           .send({
             quantity: 2,
             type: 'STOCK_OUT',

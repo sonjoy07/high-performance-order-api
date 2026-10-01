@@ -104,10 +104,12 @@ describe('Authentication & Authorization Module (/api/v1/auth)', () => {
     });
 
     it('should return 400 validation error for weak/short password (< 8 chars)', async () => {
-      const response = await request(app).post('/api/v1/auth/register').send({
-        email: `valid-${Date.now()}@example.com`,
-        password: 'short',
-      });
+      const response = await request(app)
+        .post('/api/v1/auth/register')
+        .send({
+          email: `valid-${Date.now()}@example.com`,
+          password: 'short',
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);

@@ -66,6 +66,15 @@ high-performance-order-api/
 │   │   ├── health/              # Health check module
 │   │   │   ├── health.controller.ts
 │   │   │   └── health.route.ts
+│   │   ├── auth/                # Authentication & Authorization module
+│   │   │   ├── auth.controller.ts
+│   │   │   ├── auth.middleware.ts
+│   │   │   ├── auth.repository.ts
+│   │   │   ├── auth.route.ts
+│   │   │   ├── auth.service.ts
+│   │   │   ├── auth.types.ts
+│   │   │   ├── auth.utils.ts
+│   │   │   └── auth.validation.ts
 │   │   ├── categories/          # Category management module
 │   │   │   ├── category.controller.ts
 │   │   │   ├── category.repository.ts
@@ -96,18 +105,23 @@ high-performance-order-api/
 │   │       ├── idempotency.service.ts
 │   │       ├── idempotency.types.ts
 │   │       └── idempotency.utils.ts
+│   ├── types/                   # TypeScript ambient declarations (Express.Request augmentation)
+│   │   └── express.d.ts
 │   ├── jobs/                    # BullMQ job workers and consumers (for future phases)
 │   ├── queues/                  # BullMQ queue producers and definitions (for future phases)
 │   ├── events/                  # Domain events and pub/sub handlers (for future phases)
 │   ├── app.ts                   # Express application setup
 │   └── server.ts                # Server startup and graceful termination
 ├── tests/                       # Automated test suites (Jest + Supertest)
+│   ├── auth.test.ts             # Authentication, RBAC & IDOR tests
 │   ├── category.test.ts         # Category API integration tests
 │   ├── health.test.ts           # Health & 404 integration tests
 │   ├── idempotency.test.ts      # Idempotency & Replay integration tests
 │   ├── inventory.test.ts        # Inventory & Concurrency integration tests
 │   ├── order.test.ts            # Order Creation & Concurrency integration tests
-│   └── product.test.ts          # Product API integration tests
+│   ├── product.test.ts          # Product API integration tests
+│   └── helpers/                 # Test auth and setup helpers
+│       └── auth.helper.ts
 ├── .env                         # Local environment configuration
 ├── .env.example                 # Template for required environment variables
 ├── .gitignore                   # Ignored files and directories for Git
@@ -456,6 +470,123 @@ If an order fails (e.g. `INSUFFICIENT_STOCK` or validation failure):
 
 ---
 
+## Authentication & Authorization
+
+Phase 7 implements production-grade stateless JWT authentication, database-persisted refresh token rotation with reuse detection, Role-Based Access Control (RBAC), and Customer Ownership Protection (IDOR prevention).
+
+### Core Token Architecture
+
+1. **Access Token:**
+   * Short-lived (15 minutes by default: `JWT_ACCESS_EXPIRES_IN=15m`).
+   * Compact, stateless JWT payload:
+     ```json
+     {
+       "sub": "user-id",
+       "role": "CUSTOMER",
+       "type": "access"
+     }
+     ```
+   * Passed via the standard HTTP header: `Authorization: Bearer <access-token>`.
+   * Verified by `authenticate` middleware without database lookups for high-throughput performance.
+
+2. **Refresh Token:**
+   * Long-lived (7 days by default: `JWT_REFRESH_EXPIRES_IN=7d`).
+   * Cryptographically random unique token ID (`tokenId` UUID v4):
+     ```json
+     {
+       "sub": "user-id",
+       "tokenId": "550e8400-e29b-41d4-a716-446655440000",
+       "type": "refresh"
+     }
+     ```
+   * **Database Hashing:** Plaintext refresh tokens are **never stored** in the database. Only a deterministic SHA-256 hash (`crypto.createHash('sha256').update(token).digest('hex')`) is persisted in the `refresh_tokens` table. Even if the database is leaked, raw refresh tokens cannot be used to forge sessions.
+
+3. **Refresh Token Rotation & Reuse Detection:**
+   * Each invocation of `POST /api/v1/auth/refresh` immediately revokes the consumed refresh token and issues a newly generated token pair.
+   * If an attacker or client attempts to replay a revoked refresh token, the server detects the reuse and immediately halts execution with `401 REVOKED_REFRESH_TOKEN`.
+
+4. **Logout & Revocation:**
+   * `POST /api/v1/auth/logout` takes `{ refreshToken }` and stamps `revokedAt = now()` on the corresponding record in PostgreSQL.
+
+---
+
+### Authentication Flow
+
+```text
+[ Client ]                     [ Express / Middleware ]                [ PostgreSQL ]
+    |                                     |                                   |
+    |--- POST /api/v1/auth/login -------->|                                   |
+    |    { email, password }              |--- Verify bcrypt password ------->|
+    |                                     |--- Store SHA-256 tokenHash ------>|
+    |<-- { accessToken, refreshToken } ---|                                   |
+    |                                     |                                   |
+    |--- Request + Bearer <accessToken> ->| (Verified locally via JWT Secret) |
+    |<-- 200 OK Response -----------------|                                   |
+    |                                     |                                   |
+    |--- Access Token Expires ------------|                                   |
+    |--- POST /api/v1/auth/refresh ------>|                                   |
+    |    { refreshToken }                 |--- Check not revoked & not exp -->|
+    |                                     |--- Atomic Rotation (Revoke+New) ->|
+    |<-- { newAccess, newRefresh } -------|                                   |
+    |                                     |                                   |
+    |--- POST /api/v1/auth/logout ------->|--- Mark revokedAt = now() ------->|
+    |<-- 200 Logged out successfully -----|                                   |
+```
+
+---
+
+### Authorization & RBAC Matrix
+
+| Endpoint | Method | Required Role | Description |
+| :--- | :--- | :--- | :--- |
+| `/health` | `GET` | **Public** | Liveness check |
+| `/api/v1/auth/register` | `POST` | **Public** | Customer user & profile registration |
+| `/api/v1/auth/login` | `POST` | **Public** | Issues Access + Refresh token pair |
+| `/api/v1/auth/refresh` | `POST` | **Public** | Rotates refresh token and issues new tokens |
+| `/api/v1/auth/logout` | `POST` | **Authenticated** | Revokes current refresh session |
+| `/api/v1/auth/me` | `GET` | **Authenticated** | Returns authenticated user & customer profile |
+| `/api/v1/categories` | `GET` | **Public** | List & filter categories |
+| `/api/v1/categories/:id` | `GET` | **Public** | Get category by ID |
+| `/api/v1/categories` | `POST` | **ADMIN** | Create new category |
+| `/api/v1/categories/:id` | `PATCH` | **ADMIN** | Update category |
+| `/api/v1/categories/:id` | `DELETE` | **ADMIN** | Delete category |
+| `/api/v1/products` | `GET` | **Public** | List, filter, search, sort products |
+| `/api/v1/products/:id` | `GET` | **Public** | Get product by ID |
+| `/api/v1/products` | `POST` | **ADMIN** | Create product + initialize inventory |
+| `/api/v1/products/:id` | `PATCH` | **ADMIN** | Update product |
+| `/api/v1/products/:id` | `DELETE` | **ADMIN** | Delete product |
+| `/api/v1/inventory/:productId` | `GET` | **ADMIN** | View physical and available stock |
+| `/api/v1/inventory/:productId/adjust` | `POST` | **ADMIN** | Stock in/out or manual count adjustment |
+| `/api/v1/inventory/:productId/movements` | `GET` | **ADMIN** | Audit ledger of inventory movements |
+| `/api/v1/orders` | `POST` | **Authenticated** | Creates order with stock reservation |
+| `/api/v1/orders/:id` | `GET` | **Authenticated** | View order details (enforces customer ownership) |
+
+---
+
+### Customer Ownership Protection & IDOR Prevention
+
+1. **Server-Side Customer Identity Derivation:**
+   * Clients **never control `customerId`** during order creation (`POST /api/v1/orders`).
+   * Even if a malicious client sends `customerId: "other-customer-uuid"`, the controller completely discards it and resolves the customer strictly via `req.user.id` from the verified JWT.
+2. **Order Access Control (`GET /api/v1/orders/:id`):**
+   * If accessed by a `CUSTOMER`, the service enforces `order.customerId === authenticatedCustomer.id`.
+   * Access attempts across customer boundaries are denied with `403 ORDER_ACCESS_DENIED`.
+   * Users with the `ADMIN` role can inspect any customer order.
+3. **Customer-Scoped Idempotency:**
+   * Idempotency is enforced by the unique constraint `(customerId, key)`. A key used by Customer A is isolated from Customer B, preventing cross-tenant replay or replay collision.
+
+---
+
+### Security Decisions & Best Practices
+
+* **Argon2 / Bcrypt Hashing:** Passwords hashed using bcrypt (10 rounds). Passwords and password hashes are never returned in responses and never printed to log streams.
+* **Constant-Time Comparison:** When non-existent emails attempt login, a dummy hash comparison is performed to defeat user enumeration timing attacks.
+* **No Plaintext Refresh Tokens in Database:** Database breach resistance is guaranteed by storing only SHA-256 digests.
+* **Separation of Token Secrets:** Access tokens and Refresh tokens use independent signing secrets (`JWT_ACCESS_SECRET` vs `JWT_REFRESH_SECRET`) and different lifetimes.
+* **Type Enforcement:** Refresh tokens cannot be presented as access tokens (`type === 'access'` check) and vice-versa.
+
+---
+
 ## Error Handling Standards
 
 All errors return uniform JSON responses:
@@ -479,10 +610,22 @@ All errors return uniform JSON responses:
 | `400 Bad Request` | `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` exceeds 255 characters or is invalid type. |
 | `400 Bad Request` | `INVALID_CATEGORY` | `categoryId` provided on product creation does not exist. |
 | `400 Bad Request` | `INVALID_ORDER` | Malformed order data. |
+| `401 Unauthorized` | `UNAUTHENTICATED` | Missing or malformed `Authorization` header. |
+| `401 Unauthorized` | `INVALID_CREDENTIALS` | Incorrect email or password during login. |
+| `401 Unauthorized` | `INVALID_ACCESS_TOKEN` | Access token signature invalid or invalid token type. |
+| `401 Unauthorized` | `ACCESS_TOKEN_EXPIRED` | Access token expiration timestamp has elapsed. |
+| `401 Unauthorized` | `INVALID_REFRESH_TOKEN` | Refresh token invalid or malformed. |
+| `401 Unauthorized` | `REFRESH_TOKEN_EXPIRED` | Refresh token expiration timestamp has elapsed. |
+| `401 Unauthorized` | `REVOKED_REFRESH_TOKEN` | Reused or revoked refresh token presented. |
+| `403 Forbidden` | `FORBIDDEN` | Insufficient role permissions (e.g. `CUSTOMER` accessing `ADMIN` endpoint). |
+| `403 Forbidden` | `ORDER_ACCESS_DENIED` | Customer attempting to access another customer's order (IDOR). |
+| `404 Not Found` | `USER_NOT_FOUND` | User account does not exist. |
 | `404 Not Found` | `PRODUCT_NOT_FOUND` | Product ID does not exist in database. |
-| `404 Not Found` | `CUSTOMER_NOT_FOUND`| Customer ID does not exist in database. |
+| `404 Not Found` | `CUSTOMER_NOT_FOUND`| Customer profile does not exist in database. |
 | `404 Not Found` | `CATEGORY_NOT_FOUND` | Category ID does not exist. |
 | `404 Not Found` | `INVENTORY_NOT_FOUND` | Product exists but has no inventory record. |
+| `404 Not Found` | `ORDER_NOT_FOUND` | Order ID does not exist. |
+| `409 Conflict` | `EMAIL_ALREADY_EXISTS` | Email address is already registered. |
 | `409 Conflict` | `IDEMPOTENCY_KEY_REUSED` | Idempotency key reused with a different request payload. |
 | `409 Conflict` | `INSUFFICIENT_STOCK` | Requested quantity exceeds available stock ($\text{quantity} - \text{reservedQuantity}$). |
 | `409 Conflict` | `INVENTORY_BELOW_RESERVED_STOCK` | Target adjustment is lower than current `reservedQuantity`. |
@@ -503,8 +646,8 @@ All errors return uniform JSON responses:
 npm test
 ```
 
-* **67 automated integration tests** across Health, Category, Product, Inventory, Order, and Idempotency suites.
-* Includes real concurrent race condition verification under PostgreSQL row-level locking and unique constraint serialization.
+* **95 automated integration tests** across Health, Auth, Category, Product, Inventory, Order, and Idempotency suites.
+* Includes real concurrent race condition verification under PostgreSQL row-level locking, token rotation tests, and IDOR customer ownership verification.
 
 ### Start Development Server
 
@@ -520,4 +663,5 @@ npm run lint
 npm run format:check
 npm run build
 ```
+
 

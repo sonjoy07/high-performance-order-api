@@ -1,12 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { AuthService } from './auth.service';
 import { AuthRepository } from './auth.repository';
-import {
-  registerSchema,
-  loginSchema,
-  refreshSchema,
-  logoutSchema,
-} from './auth.validation';
+import { registerSchema, loginSchema, refreshSchema, logoutSchema } from './auth.validation';
 
 const defaultAuthRepository = new AuthRepository();
 const defaultAuthService = new AuthService(defaultAuthRepository);

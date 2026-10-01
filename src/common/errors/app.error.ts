@@ -307,4 +307,3 @@ export class OrderNotFoundError extends AppError {
     super(404, ErrorCode.ORDER_NOT_FOUND, message, true);
   }
 }
-

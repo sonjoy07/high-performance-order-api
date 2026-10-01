@@ -1,13 +1,16 @@
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import request from 'supertest';
 import crypto from 'crypto';
+import { UserRole } from '@prisma/client';
 import { app } from '../src/app';
 import { prisma } from '../src/config/prisma';
+import { generateAccessToken } from '../src/modules/auth/auth.utils';
 
 describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
   let testCategoryId: string;
   let testCustomerId: string;
   let testUserId: string;
+  let customerToken: string;
 
   let productAId: string;
   let productBId: string;
@@ -33,6 +36,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     });
     testUserId = user.id;
     testCustomerId = user.customer!.id;
+    customerToken = generateAccessToken(testUserId, UserRole.CUSTOMER);
 
     // 2. Create Category
     const category = await prisma.category.create({
@@ -81,26 +85,26 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     });
     productBId = productB.id;
 
-    // 5. Create Product without inventory
+    // 5. Create Product with NO inventory record
     const productNoInv = await prisma.product.create({
       data: {
         categoryId: testCategoryId,
-        name: 'Order Product Without Inventory',
-        slug: `order-prod-no-inv-${Date.now()}`,
+        name: 'Order Product No Inv',
+        slug: `order-product-no-inv-${Date.now()}`,
         sku: `ORD-SKU-NO-INV-${Date.now()}`,
         price: '20.00',
       },
     });
     productNoInvId = productNoInv.id;
 
-    // 6. Create Product for Single Stock competition (Stock: 1, Reserved: 0, Price: 75.00)
-    const singleStockProd = await prisma.product.create({
+    // 6. Create product with exactly 1 in stock for race condition test
+    const singleStockProduct = await prisma.product.create({
       data: {
         categoryId: testCategoryId,
-        name: 'Order Single Stock Item',
-        slug: `order-single-stock-${Date.now()}`,
+        name: 'Single Stock Product',
+        slug: `single-stock-product-${Date.now()}`,
         sku: `ORD-SKU-SINGLE-${Date.now()}`,
-        price: '75.00',
+        price: '15.00',
         inventory: {
           create: {
             quantity: 1,
@@ -110,16 +114,16 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
         },
       },
     });
-    singleStockProductId = singleStockProd.id;
+    singleStockProductId = singleStockProduct.id;
 
-    // 7. Create Product for 10-Item High Concurrency Test (Stock: 10, Reserved: 0, Price: 30.00)
-    const tenStockProd = await prisma.product.create({
+    // 7. Create product with 10 in stock for 10-concurrent-orders test
+    const tenStockProduct = await prisma.product.create({
       data: {
         categoryId: testCategoryId,
-        name: 'Order Ten Stock Concurrency Item',
-        slug: `order-ten-stock-${Date.now()}`,
+        name: 'Ten Stock Product',
+        slug: `ten-stock-product-${Date.now()}`,
         sku: `ORD-SKU-TEN-${Date.now()}`,
-        price: '30.00',
+        price: '10.00',
         inventory: {
           create: {
             quantity: 10,
@@ -129,11 +133,11 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
         },
       },
     });
-    tenStockProductId = tenStockProd.id;
+    tenStockProductId = tenStockProduct.id;
   });
 
   afterAll(async () => {
-    // Clean up created records in reverse dependency order
+    // Clean up created data
     const productIds = [
       productAId,
       productBId,
@@ -145,16 +149,16 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     await prisma.stockReservation.deleteMany({
       where: { productId: { in: productIds } },
     });
-    await prisma.idempotencyKey.deleteMany({
-      where: { customerId: testCustomerId },
+    await prisma.orderItem.deleteMany({
+      where: { productId: { in: productIds } },
     });
     await prisma.orderStatusHistory.deleteMany({
       where: { order: { customerId: testCustomerId } },
     });
-    await prisma.orderItem.deleteMany({
-      where: { productId: { in: productIds } },
-    });
     await prisma.order.deleteMany({
+      where: { customerId: testCustomerId },
+    });
+    await prisma.idempotencyKey.deleteMany({
       where: { customerId: testCustomerId },
     });
     await prisma.inventoryMovement.deleteMany({
@@ -167,13 +171,19 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       where: { id: { in: productIds } },
     });
     if (testCategoryId) {
-      await prisma.category.deleteMany({ where: { id: testCategoryId } });
+      await prisma.category.deleteMany({
+        where: { id: testCategoryId },
+      });
     }
     if (testCustomerId) {
-      await prisma.customer.deleteMany({ where: { id: testCustomerId } });
+      await prisma.customer.deleteMany({
+        where: { id: testCustomerId },
+      });
     }
     if (testUserId) {
-      await prisma.user.deleteMany({ where: { id: testUserId } });
+      await prisma.user.deleteMany({
+        where: { id: testUserId },
+      });
     }
 
     await prisma.$disconnect();
@@ -183,9 +193,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should reject order with empty items array with 400 VALIDATION_ERROR', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [],
         });
 
@@ -197,9 +207,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should reject order with non-positive quantity with 400 VALIDATION_ERROR', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 0 }],
         });
 
@@ -208,9 +218,10 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       expect(response.body.error.code).toBe('VALIDATION_ERROR');
     });
 
-    it('should reject order with invalid customerId format with 400 VALIDATION_ERROR', async () => {
+    it('should reject order with invalid customerId format with 400 VALIDATION_ERROR if passed', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: 'not-a-uuid',
@@ -222,13 +233,21 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       expect(response.body.error.code).toBe('VALIDATION_ERROR');
     });
 
-    it('should return 404 CUSTOMER_NOT_FOUND when customer does not exist in DB', async () => {
-      const nonExistentCustomerId = '00000000-0000-0000-0000-000000000000';
+    it('should return 404 CUSTOMER_NOT_FOUND when user has no linked customer record', async () => {
+      const orphanUser = await prisma.user.create({
+        data: {
+          email: `orphan-order-${Date.now()}@example.com`,
+          passwordHash: 'dummyHash123',
+          role: UserRole.CUSTOMER,
+        },
+      });
+      const orphanToken = generateAccessToken(orphanUser.id, UserRole.CUSTOMER);
+
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${orphanToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: nonExistentCustomerId,
           items: [{ productId: productAId, quantity: 1 }],
         });
 
@@ -241,9 +260,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       const nonExistentProductId = '00000000-0000-0000-0000-000000000000';
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [{ productId: nonExistentProductId, quantity: 1 }],
         });
 
@@ -255,9 +274,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should return 404 INVENTORY_NOT_FOUND when product has no inventory record', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productNoInvId, quantity: 1 }],
         });
 
@@ -271,9 +290,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should merge duplicate product IDs into a single item with summed quantity before transaction', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [
             { productId: productAId, quantity: 2 },
             { productId: productAId, quantity: 3 },
@@ -306,9 +325,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       // productB current: qty 25, res 5, available = 20. We request 3.
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [
             { productId: productAId, quantity: 2 },
             { productId: productBId, quantity: 3 },
@@ -357,9 +376,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       // 1. Create order when product A price is 100.00
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 1 }],
         });
 
@@ -398,9 +417,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       // Request Product A (2 units - AVAILABLE) and Product B (1000 units - INSUFFICIENT)
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', crypto.randomUUID())
         .send({
-          customerId: testCustomerId,
           items: [
             { productId: productAId, quantity: 2 },
             { productId: productBId, quantity: 1000 },
@@ -444,16 +463,16 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       const requests = [
         request(app)
           .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customerToken}`)
           .set('Idempotency-Key', crypto.randomUUID())
           .send({
-            customerId: testCustomerId,
             items: [{ productId: singleStockProductId, quantity: 1 }],
           }),
         request(app)
           .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customerToken}`)
           .set('Idempotency-Key', crypto.randomUUID())
           .send({
-            customerId: testCustomerId,
             items: [{ productId: singleStockProductId, quantity: 1 }],
           }),
       ];
@@ -493,9 +512,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       const requests = Array.from({ length: 10 }, () =>
         request(app)
           .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customerToken}`)
           .set('Idempotency-Key', crypto.randomUUID())
           .send({
-            customerId: testCustomerId,
             items: [{ productId: tenStockProductId, quantity: 2 }],
           })
       );

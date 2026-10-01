@@ -42,9 +42,7 @@ export const requireRole = (...allowedRoles: UserRole[]) => {
     }
 
     if (!allowedRoles.includes(req.user.role)) {
-      throw new AuthorizationError(
-        `Access forbidden: required role ${allowedRoles.join(' or ')}`
-      );
+      throw new AuthorizationError(`Access forbidden: required role ${allowedRoles.join(' or ')}`);
     }
 
     next();

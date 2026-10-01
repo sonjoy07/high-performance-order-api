@@ -2,12 +2,17 @@ import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import request from 'supertest';
 import { app } from '../src/app';
 import { prisma } from '../src/config/prisma';
+import { createTestAdmin } from './helpers/auth.helper';
 
 describe('Product APIs (/api/v1/products)', () => {
   let testCategoryId: string;
   let createdProductId: string;
+  let adminToken: string;
 
   beforeAll(async () => {
+    const admin = await createTestAdmin();
+    adminToken = admin.accessToken;
+
     // Ensure we have a valid category for testing
     const cat = await prisma.category.findFirst();
     if (cat) {
@@ -38,15 +43,18 @@ describe('Product APIs (/api/v1/products)', () => {
 
   describe('POST /api/v1/products', () => {
     it('should create a new product successfully with inventory record', async () => {
-      const response = await request(app).post('/api/v1/products').send({
-        categoryId: testCategoryId,
-        name: 'Test Wireless Earbuds',
-        slug: 'test-wireless-earbuds',
-        description: 'True wireless noise cancelling earbuds for test',
-        sku: 'TEST-PROD-001',
-        price: 99.99,
-        isActive: true,
-      });
+      const response = await request(app)
+        .post('/api/v1/products')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          categoryId: testCategoryId,
+          name: 'Test Wireless Earbuds',
+          slug: 'test-wireless-earbuds',
+          description: 'True wireless noise cancelling earbuds for test',
+          sku: 'TEST-PROD-001',
+          price: 99.99,
+          isActive: true,
+        });
 
       expect(response.status).toBe(201);
       expect(response.body.success).toBe(true);
@@ -67,13 +75,16 @@ describe('Product APIs (/api/v1/products)', () => {
     });
 
     it('should return 400 INVALID_CATEGORY when categoryId does not exist', async () => {
-      const response = await request(app).post('/api/v1/products').send({
-        categoryId: '00000000-0000-0000-0000-000000000000',
-        name: 'Invalid Category Product',
-        slug: 'invalid-cat-prod',
-        sku: 'TEST-PROD-002',
-        price: 49.99,
-      });
+      const response = await request(app)
+        .post('/api/v1/products')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          categoryId: '00000000-0000-0000-0000-000000000000',
+          name: 'Invalid Category Product',
+          slug: 'invalid-cat-prod',
+          sku: 'TEST-PROD-002',
+          price: 49.99,
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -81,13 +92,16 @@ describe('Product APIs (/api/v1/products)', () => {
     });
 
     it('should return 409 DUPLICATE_SKU when SKU already exists', async () => {
-      const response = await request(app).post('/api/v1/products').send({
-        categoryId: testCategoryId,
-        name: 'Duplicate SKU Product',
-        slug: 'duplicate-sku-prod',
-        sku: 'TEST-PROD-001',
-        price: 79.99,
-      });
+      const response = await request(app)
+        .post('/api/v1/products')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          categoryId: testCategoryId,
+          name: 'Duplicate SKU Product',
+          slug: 'duplicate-sku-prod',
+          sku: 'TEST-PROD-001',
+          price: 79.99,
+        });
 
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
@@ -95,13 +109,16 @@ describe('Product APIs (/api/v1/products)', () => {
     });
 
     it('should return 409 DUPLICATE_PRODUCT when slug already exists', async () => {
-      const response = await request(app).post('/api/v1/products').send({
-        categoryId: testCategoryId,
-        name: 'Duplicate Slug Product',
-        slug: 'test-wireless-earbuds',
-        sku: 'TEST-PROD-003',
-        price: 79.99,
-      });
+      const response = await request(app)
+        .post('/api/v1/products')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          categoryId: testCategoryId,
+          name: 'Duplicate Slug Product',
+          slug: 'test-wireless-earbuds',
+          sku: 'TEST-PROD-003',
+          price: 79.99,
+        });
 
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
@@ -109,13 +126,16 @@ describe('Product APIs (/api/v1/products)', () => {
     });
 
     it('should return 400 VALIDATION_ERROR when price is negative', async () => {
-      const response = await request(app).post('/api/v1/products').send({
-        categoryId: testCategoryId,
-        name: 'Negative Price Product',
-        slug: 'negative-price-prod',
-        sku: 'TEST-PROD-NEG',
-        price: -10,
-      });
+      const response = await request(app)
+        .post('/api/v1/products')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          categoryId: testCategoryId,
+          name: 'Negative Price Product',
+          slug: 'negative-price-prod',
+          sku: 'TEST-PROD-NEG',
+          price: -10,
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -219,10 +239,13 @@ describe('Product APIs (/api/v1/products)', () => {
 
   describe('PATCH /api/v1/products/:id', () => {
     it('should partially update product price and description', async () => {
-      const response = await request(app).patch(`/api/v1/products/${createdProductId}`).send({
-        price: 119.99,
-        description: 'Updated description for testing',
-      });
+      const response = await request(app)
+        .patch(`/api/v1/products/${createdProductId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          price: 119.99,
+          description: 'Updated description for testing',
+        });
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -233,6 +256,7 @@ describe('Product APIs (/api/v1/products)', () => {
     it('should return 404 for updating non-existent product', async () => {
       const response = await request(app)
         .patch('/api/v1/products/00000000-0000-0000-0000-000000000000')
+        .set('Authorization', `Bearer ${adminToken}`)
         .send({ price: 100 });
 
       expect(response.status).toBe(404);
@@ -243,7 +267,9 @@ describe('Product APIs (/api/v1/products)', () => {
 
   describe('DELETE /api/v1/products/:id', () => {
     it('should delete a product without historical orders', async () => {
-      const response = await request(app).delete(`/api/v1/products/${createdProductId}`);
+      const response = await request(app)
+        .delete(`/api/v1/products/${createdProductId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);

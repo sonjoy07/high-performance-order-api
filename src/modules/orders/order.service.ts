@@ -343,9 +343,7 @@ export class OrderService {
       });
 
       if (!customer || order.customerId !== customer.id) {
-        throw new OrderAccessDeniedError(
-          'You do not have permission to access this order'
-        );
+        throw new OrderAccessDeniedError('You do not have permission to access this order');
       }
     }
 

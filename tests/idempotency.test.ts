@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import request from 'supertest';
+import { UserRole } from '@prisma/client';
 import { app } from '../src/app';
 import { prisma } from '../src/config/prisma';
+import { generateAccessToken } from '../src/modules/auth/auth.utils';
 
 describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
   let testCategoryId: string;
   let testCustomerId: string;
   let testUserId: string;
+  let customerToken: string;
 
   let productAId: string;
   let productBId: string;
@@ -30,6 +33,7 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
     });
     testUserId = user.id;
     testCustomerId = user.customer!.id;
+    customerToken = generateAccessToken(testUserId, UserRole.CUSTOMER);
 
     // 2. Create Category
     const category = await prisma.category.create({
@@ -59,14 +63,14 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
     });
     productAId = productA.id;
 
-    // 4. Create Product B (Stock: 50, Reserved: 0, Price: 45.00)
+    // 4. Create Product B (Stock: 50, Reserved: 0, Price: 40.00)
     const productB = await prisma.product.create({
       data: {
         categoryId: testCategoryId,
         name: 'Idempotency Product Beta',
         slug: `idemp-prod-beta-${Date.now()}`,
         sku: `IDEMP-SKU-B-${Date.now()}`,
-        price: '45.00',
+        price: '40.00',
         inventory: {
           create: {
             quantity: 50,
@@ -78,13 +82,13 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
     });
     productBId = productB.id;
 
-    // 5. Create Product for Combined Concurrency Test (Stock: 5, Reserved: 0, Price: 25.00)
+    // 5. Create Product with limited stock (Stock: 5, Reserved: 0) for competition test
     const limitedStockProd = await prisma.product.create({
       data: {
         categoryId: testCategoryId,
-        name: 'Limited Stock Competition Item',
+        name: 'Limited Stock Competing Product',
         slug: `limited-stock-comp-${Date.now()}`,
-        sku: `IDEMP-SKU-LIMIT-${Date.now()}`,
+        sku: `IDEMP-SKU-COMP-${Date.now()}`,
         price: '25.00',
         inventory: {
           create: {
@@ -142,8 +146,8 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
     it('should return 400 IDEMPOTENCY_KEY_REQUIRED when header is omitted', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 1 }],
         });
 
@@ -156,9 +160,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
     it('should return 400 IDEMPOTENCY_KEY_REQUIRED when header is empty or only whitespace', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', '   ')
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 1 }],
         });
 
@@ -171,9 +175,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       const longKey = 'k'.repeat(256);
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', longKey)
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 1 }],
         });
 
@@ -187,13 +191,13 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
     it('should return original order response on replay without creating duplicate order or reservation', async () => {
       const idempotencyKey = `idemp-key-${Date.now()}`;
       const payload = {
-        customerId: testCustomerId,
         items: [{ productId: productAId, quantity: 2 }],
       };
 
       // 1. Initial request
       const firstResponse = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send(payload);
 
@@ -205,6 +209,7 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       // 2. Retry with exact same key and exact same payload
       const secondResponse = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send(payload);
 
@@ -238,9 +243,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       // First order: Product A then Product B
       const res1 = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({
-          customerId: testCustomerId,
           items: [
             { productId: productAId, quantity: 1 },
             { productId: productBId, quantity: 2 },
@@ -253,9 +258,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       // Second order with SAME key: Product B then Product A (different input ordering)
       const res2 = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({
-          customerId: testCustomerId,
           items: [
             { productId: productBId, quantity: 2 },
             { productId: productAId, quantity: 1 },
@@ -274,9 +279,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       // First request: quantity = 2
       const firstRes = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 2 }],
         });
 
@@ -285,9 +290,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       // Second request with SAME key: quantity = 5
       const secondRes = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 5 }],
         });
 
@@ -307,9 +312,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       // 1. Initial attempt fails due to insufficient stock (asking for 1000 units)
       const failRes = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productBId, quantity: 1000 }],
         });
 
@@ -325,9 +330,9 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       // 2. Client retries with the SAME key but with an affordable quantity (1 unit)
       const successRes = await request(app)
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({
-          customerId: testCustomerId,
           items: [{ productId: productBId, quantity: 1 }],
         });
 
@@ -347,7 +352,6 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
     it('should handle 10 concurrent requests with the SAME key and payload: exactly 1 order created, all 10 return identical response', async () => {
       const sharedKey = `shared-concurrent-key-${Date.now()}`;
       const payload = {
-        customerId: testCustomerId,
         items: [{ productId: productAId, quantity: 2 }],
       };
 
@@ -359,7 +363,11 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
 
       // Launch 10 simultaneous requests
       const requests = Array.from({ length: 10 }, () =>
-        request(app).post('/api/v1/orders').set('Idempotency-Key', sharedKey).send(payload)
+        request(app)
+          .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customerToken}`)
+          .set('Idempotency-Key', sharedKey)
+          .send(payload)
       );
 
       const responses = await Promise.all(requests);
@@ -410,16 +418,16 @@ describe('Idempotent Order Creation APIs (POST /api/v1/orders)', () => {
       const requests = [
         request(app)
           .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customerToken}`)
           .set('Idempotency-Key', keyA)
           .send({
-            customerId: testCustomerId,
             items: [{ productId: limitedStockProductId, quantity: 5 }],
           }),
         request(app)
           .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customerToken}`)
           .set('Idempotency-Key', keyB)
           .send({
-            customerId: testCustomerId,
             items: [{ productId: limitedStockProductId, quantity: 5 }],
           }),
       ];

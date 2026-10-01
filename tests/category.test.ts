@@ -2,12 +2,17 @@ import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import request from 'supertest';
 import { app } from '../src/app';
 import { prisma } from '../src/config/prisma';
+import { createTestAdmin } from './helpers/auth.helper';
 
 describe('Category APIs (/api/v1/categories)', () => {
   let createdCategoryId: string;
   let categoryWithProductsId: string;
+  let adminToken: string;
 
   beforeAll(async () => {
+    const admin = await createTestAdmin();
+    adminToken = admin.accessToken;
+
     // Find or create a category that has products for the restriction test
     const cat = await prisma.category.findFirst({
       where: { products: { some: {} } },
@@ -27,11 +32,14 @@ describe('Category APIs (/api/v1/categories)', () => {
 
   describe('POST /api/v1/categories', () => {
     it('should create a new category successfully', async () => {
-      const response = await request(app).post('/api/v1/categories').send({
-        name: 'Test Gadgets',
-        slug: 'test-gadgets',
-        description: 'Category for testing gadgets',
-      });
+      const response = await request(app)
+        .post('/api/v1/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Test Gadgets',
+          slug: 'test-gadgets',
+          description: 'Category for testing gadgets',
+        });
 
       expect(response.status).toBe(201);
       expect(response.body.success).toBe(true);
@@ -43,10 +51,13 @@ describe('Category APIs (/api/v1/categories)', () => {
     });
 
     it('should return 400 validation error if name is too short', async () => {
-      const response = await request(app).post('/api/v1/categories').send({
-        name: 'A',
-        slug: 'valid-slug',
-      });
+      const response = await request(app)
+        .post('/api/v1/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'A',
+          slug: 'valid-slug',
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -54,10 +65,13 @@ describe('Category APIs (/api/v1/categories)', () => {
     });
 
     it('should return 400 validation error if slug is not URL-friendly', async () => {
-      const response = await request(app).post('/api/v1/categories').send({
-        name: 'Valid Name',
-        slug: 'Invalid Slug With Spaces!',
-      });
+      const response = await request(app)
+        .post('/api/v1/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Valid Name',
+          slug: 'Invalid Slug With Spaces!',
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -65,10 +79,13 @@ describe('Category APIs (/api/v1/categories)', () => {
     });
 
     it('should return 409 conflict when category name already exists', async () => {
-      const response = await request(app).post('/api/v1/categories').send({
-        name: 'Test Gadgets',
-        slug: 'completely-different-slug',
-      });
+      const response = await request(app)
+        .post('/api/v1/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Test Gadgets',
+          slug: 'completely-different-slug',
+        });
 
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
@@ -76,10 +93,13 @@ describe('Category APIs (/api/v1/categories)', () => {
     });
 
     it('should return 409 conflict when category slug already exists', async () => {
-      const response = await request(app).post('/api/v1/categories').send({
-        name: 'Completely Different Name',
-        slug: 'test-gadgets',
-      });
+      const response = await request(app)
+        .post('/api/v1/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Completely Different Name',
+          slug: 'test-gadgets',
+        });
 
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
@@ -138,10 +158,13 @@ describe('Category APIs (/api/v1/categories)', () => {
 
   describe('PATCH /api/v1/categories/:id', () => {
     it('should partially update category name and slug', async () => {
-      const response = await request(app).patch(`/api/v1/categories/${createdCategoryId}`).send({
-        name: 'Test Gadgets Updated',
-        slug: 'test-gadgets-updated',
-      });
+      const response = await request(app)
+        .patch(`/api/v1/categories/${createdCategoryId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Test Gadgets Updated',
+          slug: 'test-gadgets-updated',
+        });
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -150,7 +173,10 @@ describe('Category APIs (/api/v1/categories)', () => {
     });
 
     it('should return 400 if body is empty', async () => {
-      const response = await request(app).patch(`/api/v1/categories/${createdCategoryId}`).send({});
+      const response = await request(app)
+        .patch(`/api/v1/categories/${createdCategoryId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({});
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -162,7 +188,9 @@ describe('Category APIs (/api/v1/categories)', () => {
     it('should return 409 CATEGORY_HAS_PRODUCTS when deleting category with products', async () => {
       if (!categoryWithProductsId) return;
 
-      const response = await request(app).delete(`/api/v1/categories/${categoryWithProductsId}`);
+      const response = await request(app)
+        .delete(`/api/v1/categories/${categoryWithProductsId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
 
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
@@ -170,7 +198,9 @@ describe('Category APIs (/api/v1/categories)', () => {
     });
 
     it('should delete a category with no products successfully', async () => {
-      const response = await request(app).delete(`/api/v1/categories/${createdCategoryId}`);
+      const response = await request(app)
+        .delete(`/api/v1/categories/${createdCategoryId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);

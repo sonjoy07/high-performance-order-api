@@ -83,9 +83,7 @@ export class AuthRepository {
   /**
    * Finds a refresh token by its SHA-256 hash, including the owner user.
    */
-  public async findRefreshTokenByHash(
-    tokenHash: string
-  ): Promise<RefreshTokenWithUser | null> {
+  public async findRefreshTokenByHash(tokenHash: string): Promise<RefreshTokenWithUser | null> {
     return prisma.refreshToken.findUnique({
       where: { tokenHash },
       include: { user: true },
