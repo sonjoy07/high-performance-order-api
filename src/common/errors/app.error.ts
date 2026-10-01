@@ -8,6 +8,15 @@ export enum ErrorCode {
   UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
   DATABASE_ERROR = 'DATABASE_ERROR',
   INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR',
+
+  // Domain specific error codes
+  CATEGORY_NOT_FOUND = 'CATEGORY_NOT_FOUND',
+  PRODUCT_NOT_FOUND = 'PRODUCT_NOT_FOUND',
+  DUPLICATE_CATEGORY = 'DUPLICATE_CATEGORY',
+  DUPLICATE_PRODUCT = 'DUPLICATE_PRODUCT',
+  DUPLICATE_SKU = 'DUPLICATE_SKU',
+  INVALID_CATEGORY = 'INVALID_CATEGORY',
+  CATEGORY_HAS_PRODUCTS = 'CATEGORY_HAS_PRODUCTS',
 }
 
 export class AppError extends Error {
@@ -85,5 +94,51 @@ export class DatabaseError extends AppError {
 export class InternalServerError extends AppError {
   constructor(message = 'Internal server error') {
     super(500, ErrorCode.INTERNAL_SERVER_ERROR, message, false);
+  }
+}
+
+// ==========================================
+// Category & Product Domain Errors
+// ==========================================
+
+export class CategoryNotFoundError extends AppError {
+  constructor(message = 'Category not found') {
+    super(404, ErrorCode.CATEGORY_NOT_FOUND, message, true);
+  }
+}
+
+export class ProductNotFoundError extends AppError {
+  constructor(message = 'Product not found') {
+    super(404, ErrorCode.PRODUCT_NOT_FOUND, message, true);
+  }
+}
+
+export class DuplicateCategoryError extends AppError {
+  constructor(message = 'Category already exists') {
+    super(409, ErrorCode.DUPLICATE_CATEGORY, message, true);
+  }
+}
+
+export class DuplicateProductError extends AppError {
+  constructor(message = 'Product with this slug already exists') {
+    super(409, ErrorCode.DUPLICATE_PRODUCT, message, true);
+  }
+}
+
+export class DuplicateSkuError extends AppError {
+  constructor(message = 'Product with this SKU already exists') {
+    super(409, ErrorCode.DUPLICATE_SKU, message, true);
+  }
+}
+
+export class InvalidCategoryError extends AppError {
+  constructor(message = 'Invalid category') {
+    super(400, ErrorCode.INVALID_CATEGORY, message, true);
+  }
+}
+
+export class CategoryHasProductsError extends AppError {
+  constructor(message = 'Cannot delete category with associated products') {
+    super(409, ErrorCode.CATEGORY_HAS_PRODUCTS, message, true);
   }
 }

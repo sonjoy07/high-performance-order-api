@@ -21,20 +21,20 @@ A production-grade, high-performance Order Processing & Inventory Management RES
 
 ## Architecture & Layering
 
-The project adheres to a strict separation of concerns:
+The project adheres to a strict separation of concerns across all modules:
 
 ```text
-server.ts         → Process lifecycle, port binding, and graceful shutdown
-   ↓
-app.ts            → Express app configuration, security headers, middleware pipeline
-   ↓
-routes            → Routing definitions and HTTP method mapping
-   ↓
-controllers       → HTTP request handling, response formatting, status codes
-   ↓
-services          → Core business logic, transactions, and domain rules
-   ↓
-repositories      → Data persistence, database queries, and cache operations
+Route             → HTTP method and path mapping + Zod request validation
+  ↓
+Controller        → Request unwrapping, parameter extraction, response serialization (No business rules)
+  ↓
+Service           → Domain rules, business constraints, coordination across repositories
+  ↓
+Repository        → Direct Prisma queries, database projections, atomic transactions
+  ↓
+Prisma ORM       → Type-safe query engine via @prisma/adapter-pg
+  ↓
+PostgreSQL        → Relational persistence with B-Tree indexes and referential integrity
 ```
 
 ### Folder Structure
@@ -48,21 +48,45 @@ high-performance-order-api/
 │   └── seed.ts                  # Database seeding script with realistic demo data
 ├── src/
 │   ├── config/
-│   │   ├── env.ts               # Environment and application configuration with Zod validation
+│   │   ├── env.ts               # Environment configuration with Zod runtime validation
 │   │   └── prisma.ts            # Singleton PrismaClient instance with PostgreSQL adapter
 │   ├── common/
 │   │   ├── errors/              # Centralized application errors and ErrorCode enum
-│   │   ├── middleware/          # Global middleware (request logger, error handler, 404 handler)
-│   │   └── logger/              # Pino structured logger configuration
-│   ├── modules/                 # Feature-based business modules
-│   │   └── health/              # Health check module (controller, route)
+│   │   │   └── app.error.ts
+│   │   ├── middleware/          # Global Express middleware
+│   │   │   ├── error.middleware.ts
+│   │   │   ├── not-found.middleware.ts
+│   │   │   ├── request-logger.middleware.ts
+│   │   │   └── validate.middleware.ts # Zod request validation middleware
+│   │   ├── logger/              # Pino structured logger configuration
+│   │   │   └── logger.ts
+│   │   └── types/               # Shared pagination and API response interfaces
+│   │       └── pagination.ts
+│   ├── modules/                 # Modular domain features
+│   │   ├── health/              # Health check module
+│   │   │   ├── health.controller.ts
+│   │   │   └── health.route.ts
+│   │   ├── categories/          # Category management module
+│   │   │   ├── category.controller.ts
+│   │   │   ├── category.repository.ts
+│   │   │   ├── category.route.ts
+│   │   │   ├── category.service.ts
+│   │   │   └── category.validation.ts
+│   │   └── products/            # Product catalog & inventory module
+│   │       ├── product.controller.ts
+│   │       ├── product.repository.ts
+│   │       ├── product.route.ts
+│   │       ├── product.service.ts
+│   │       └── product.validation.ts
 │   ├── jobs/                    # BullMQ job workers and consumers (for future phases)
 │   ├── queues/                  # BullMQ queue producers and definitions (for future phases)
 │   ├── events/                  # Domain events and pub/sub handlers (for future phases)
 │   ├── app.ts                   # Express application setup
 │   └── server.ts                # Server startup and graceful termination
-├── tests/                       # Unit and integration tests (Jest + Supertest)
-│   └── health.test.ts
+├── tests/                       # Automated test suites (Jest + Supertest)
+│   ├── category.test.ts         # Category API integration tests
+│   ├── health.test.ts           # Health & 404 integration tests
+│   └── product.test.ts          # Product API integration tests
 ├── .env                         # Local environment configuration
 ├── .env.example                 # Template for required environment variables
 ├── .gitignore                   # Ignored files and directories for Git
@@ -76,302 +100,166 @@ high-performance-order-api/
 
 ---
 
-## Database Architecture
+## Category API
 
-### Entity Relationship Diagram (ERD)
+Base path: `/api/v1/categories`
 
-```mermaid
-erDiagram
-    USER ||--o| CUSTOMER : "profile (1:1)"
-    CUSTOMER ||--o{ ORDER : "places (1:N)"
-    CUSTOMER ||--o{ IDEMPOTENCY_KEY : "creates (1:N)"
-    CATEGORY ||--o{ PRODUCT : "classifies (1:N)"
-    PRODUCT ||--|| INVENTORY : "maintains stock (1:1)"
-    PRODUCT ||--o{ INVENTORY_MOVEMENT : "audit trail (1:N)"
-    PRODUCT ||--o{ ORDER_ITEM : "ordered in (1:N)"
-    PRODUCT ||--o{ STOCK_RESERVATION : "reserved in (1:N)"
-    ORDER ||--|{ ORDER_ITEM : "contains items (1:N)"
-    ORDER ||--o{ ORDER_STATUS_HISTORY : "tracks transitions (1:N)"
-    ORDER ||--o{ STOCK_RESERVATION : "reserves stock (1:N)"
+| Method | Endpoint | Description | Status Code |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/categories` | Create a new category | `201 Created` |
+| `GET` | `/api/v1/categories` | List categories with search & pagination | `200 OK` |
+| `GET` | `/api/v1/categories/:id` | Get category details by ID | `200 OK` |
+| `PATCH` | `/api/v1/categories/:id` | Partially update category name, slug, or description | `200 OK` |
+| `DELETE` | `/api/v1/categories/:id` | Delete category (rejected if products are assigned) | `200 OK` |
 
-    USER {
-        string id PK
-        string email UK
-        string passwordHash
-        enum role
-        datetime createdAt
-        datetime updatedAt
-    }
+### Create Category Payload (`POST /api/v1/categories`)
 
-    CUSTOMER {
-        string id PK
-        string userId FK,UK
-        string firstName
-        string lastName
-        string phone
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    CATEGORY {
-        string id PK
-        string name UK
-        string slug UK
-        string description
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    PRODUCT {
-        string id PK
-        string categoryId FK
-        string name
-        string slug UK
-        string description
-        string sku UK
-        decimal price
-        boolean isActive
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    INVENTORY {
-        string id PK
-        string productId FK,UK
-        int quantity
-        int reservedQuantity
-        int version
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    INVENTORY_MOVEMENT {
-        string id PK
-        string productId FK
-        enum type
-        int quantity
-        string referenceType
-        string referenceId
-        datetime createdAt
-    }
-
-    ORDER {
-        string id PK
-        string customerId FK
-        string orderNumber UK
-        enum status
-        decimal totalAmount
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    ORDER_ITEM {
-        string id PK
-        string orderId FK
-        string productId FK
-        int quantity
-        decimal unitPrice
-        decimal totalPrice
-        datetime createdAt
-    }
-
-    ORDER_STATUS_HISTORY {
-        string id PK
-        string orderId FK
-        enum fromStatus
-        enum toStatus
-        datetime changedAt
-        string reason
-    }
-
-    STOCK_RESERVATION {
-        string id PK
-        string orderId FK
-        string productId FK
-        int quantity
-        enum status
-        datetime expiresAt
-        datetime createdAt
-        datetime releasedAt
-    }
-
-    IDEMPOTENCY_KEY {
-        string id PK
-        string key
-        string customerId FK
-        string requestHash
-        int responseStatus
-        jsonb responseBody
-        datetime createdAt
-        datetime expiresAt
-    }
+```json
+{
+  "name": "Electronics",
+  "slug": "electronics",
+  "description": "Computing devices, smartphones, and accessories"
+}
 ```
 
-### Main Entities & Design Decisions
+---
 
-1. **User & Customer (`1:1` via unique `userId`):**
-   * `User` isolates authentication and credentials (`email`, `passwordHash`, `role`).
-   * `Customer` encapsulates profile details (`firstName`, `lastName`, `phone`).
-   * **Decision:** `userId` on `Customer` is strictly marked `@unique`. An authenticated customer user should have exactly one customer profile to prevent split order histories and account ambiguity. Non-customer users (e.g. `ADMIN`) do not require a `Customer` profile.
+## Product API
 
-2. **Category & Product (`1:N`):**
-   * Products belong to a Category (`categoryId`).
-   * Products enforce unique `sku` (Stock Keeping Unit) and `slug` for clean URL resolution.
-   * `isActive` flag enables soft-deactivation without deleting historical catalog references.
+Base path: `/api/v1/products`
 
-3. **Inventory & Optimistic Concurrency:**
-   * `Inventory` maintains a strict `1:1` relationship with `Product` (`productId` is `@unique`).
-   * Separate `quantity` (physical stock on hand) and `reservedQuantity` (stock earmarked for unfulfilled checkout sessions) to prevent overselling.
-   * An integer `version` field is included to facilitate lock-free **optimistic concurrency control** (`WHERE id = ? AND version = ?`) during high-throughput order bursts.
+| Method | Endpoint | Description | Status Code |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/products` | Create a product with linked inventory | `201 Created` |
+| `GET` | `/api/v1/products` | List products with filtering, search, sorting & pagination | `200 OK` |
+| `GET` | `/api/v1/products/:id` | Get product details with category | `200 OK` |
+| `PATCH` | `/api/v1/products/:id` | Partially update product details | `200 OK` |
+| `DELETE` | `/api/v1/products/:id` | Safe product deletion (soft delete if historical orders exist) | `200 OK` |
 
-4. **Inventory Movements (Audit Trail):**
-   * Append-only ledger recording all stock changes (`STOCK_IN`, `STOCK_OUT`, `RESERVATION`, `RELEASE`, `ADJUSTMENT`).
-   * Correlates each movement with a `referenceType` (e.g., `ORDER`, `INITIAL_STOCK`, `PURCHASE_ORDER`) and optional `referenceId`.
+### Create Product Payload (`POST /api/v1/products`)
 
-5. **Order & Historical Immutability (`OrderItem`):**
-   * `Order` contains human-readable unique `orderNumber` and an enumerated lifecycle state (`PENDING`, `CONFIRMED`, `PROCESSING`, `SHIPPED`, `DELIVERED`, `CANCELLED`).
-   * **Crucial Immutability Invariant:** `OrderItem.unitPrice` and `OrderItem.totalPrice` record the exact price negotiated at checkout time. Historical order data **never** references live product catalog prices, preserving invoicing and accounting accuracy even if catalog prices change or products are retired.
-
-6. **Order Status History:**
-   * Append-only transition log capturing `fromStatus` -> `toStatus`, `changedAt`, and an optional `reason` (e.g. "Payment confirmed", "Customer cancelled").
-
-7. **Stock Reservation:**
-   * Protects against overselling during checkout hold windows before final payment confirmation.
-   * Tracks statuses: `ACTIVE`, `RELEASED`, `CONSUMED`, `EXPIRED`, along with `expiresAt` and `releasedAt`.
-
-8. **Idempotency Key:**
-   * Guards against duplicate charges and double-orders caused by network timeouts or retry loops.
-   * Enforces composite uniqueness: `@@unique([customerId, key])`, scoping client keys per customer.
-   * Caches `requestHash`, `responseStatus`, and `responseBody` (JSONB) with an `expiresAt` timestamp for TTL eviction.
+```json
+{
+  "categoryId": "ee13d707-3121-4870-adaf-8171443ac14b",
+  "name": "Wireless Noise-Cancelling Headphones",
+  "slug": "wireless-noise-cancelling-headphones",
+  "description": "High-fidelity wireless headphones with 40-hour battery life",
+  "sku": "TECH-WNC-001",
+  "price": 199.99,
+  "isActive": true
+}
+```
 
 ---
 
-### Money Handling: Why `Decimal` instead of `Float`
+## Filtering, Pagination & Sorting
 
-Financial quantities (`Product.price`, `Order.totalAmount`, `OrderItem.unitPrice`, `OrderItem.totalPrice`) are strictly defined as PostgreSQL `DECIMAL(12, 2)`:
+### Product Filtering Query Parameters
 
-* **No Binary Approximations:** Floating-point numbers (`FLOAT`, `DOUBLE PRECISION`, IEEE 754) store values as base-2 fractions, causing notorious rounding errors (e.g., `0.1 + 0.2 = 0.30000000000000004`). In e-commerce, accumulating fractional discrepancies across thousands of line items causes unbalanced ledgers, invoice disputes, and tax audit failures.
-* **Exact Base-10 Arithmetic:** PostgreSQL `DECIMAL/NUMERIC` provides arbitrary-precision base-10 storage. In TypeScript, Prisma maps this directly to `Prisma.Decimal` (powered by `decimal.js`), ensuring zero precision drift during arithmetic calculations.
+Filtering parameters can be combined freely on `GET /api/v1/products`:
+
+* `search`: Case-insensitive partial matching across **Product Name** and **SKU** (`contains`, `mode: 'insensitive'`).
+* `categoryId`: Filter products by parent category UUID.
+* `minPrice`: Filter products with price $\ge$ `minPrice`.
+* `maxPrice`: Filter products with price $\le$ `maxPrice`. (Validated: `minPrice <= maxPrice`).
+* `isActive`: Boolean flag (`true` or `false`) to filter active catalog items.
+
+**Example Request:**
+```http
+GET /api/v1/products?search=headphone&categoryId=ee13d707-3121-4870-adaf-8171443ac14b&minPrice=50&maxPrice=300&isActive=true&page=1&limit=20&sortBy=price&sortOrder=asc
+```
+
+### Pagination Implementation
+
+All list endpoints implement offset pagination:
+
+$$\text{offset} = (\text{page} - 1) \times \text{limit}$$
+
+* `page`: Integer $\ge 1$ (default: `1`).
+* `limit`: Integer $\ge 1$ and $\le 100$ (default: `20`, maximum: `100`).
+* Protected against memory exhaustion: Limits $> 100$ or $< 1$ trigger immediate `400 VALIDATION_ERROR`.
+
+**Pagination Response Structure:**
+```json
+{
+  "success": true,
+  "data": [ ... ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "total": 245,
+    "totalPages": 13
+  }
+}
+```
+
+### Sorting & Field Whitelisting
+
+Sorting inputs are strictly validated against whitelisted database fields to prevent arbitrary query injection:
+
+* **Product Sort Fields (`sortBy`):** `name`, `price`, `createdAt`, `updatedAt` (default: `createdAt`).
+* **Category Sort Fields (`sortBy`):** `name`, `createdAt`, `updatedAt` (default: `createdAt`).
+* **Sort Direction (`sortOrder`):** `asc` (ascending) or `desc` (descending, default: `desc`).
 
 ---
 
-### Referential Integrity & Deletion Strategy
+## Query Optimization & N+1 Prevention
 
-To prevent silent data corruption or loss of financial audit history, destructive cascades are strictly forbidden on critical business entities:
+1. **Relation Loading without N+1:**
+   * Products list queries use Prisma relation joins (`include: { category: { select: { id: true, name: true, slug: true } } }`).
+   * This executes a single optimized PostgreSQL SQL join, avoiding the classic anti-pattern of 1 query for products + $N$ individual queries for each category.
+2. **Selective Field Projections:**
+   * Only necessary fields are returned; internal password hashes, system metadata, or unindexed blobs are excluded.
+3. **Index Utilization:**
+   * Queries leverage composite and single-column B-tree indexes defined in Phase 2:
+     * `products_categoryId_idx`, `products_isActive_idx`, `products_createdAt_idx`
+     * Unique B-tree indexes on `sku` and `slug`
+4. **Concurrent Count & Data Queries:**
+   * `prisma.$transaction([findManyQuery, countQuery])` executes the paginated fetch and total count concurrently over a single pooled connection.
 
-| Relationship | Behavior (`onDelete`) | Architectural Rationale |
+---
+
+## Validation Architecture
+
+Request validation is handled declaratively using **Zod** via [`validateRequest`](file:///d:/projects/assignment/high-performance-order-api/src/common/middleware/validate.middleware.ts):
+
+* **Fail-Fast:** Requests with invalid payloads, malformed URL slugs, negative prices, or out-of-range pagination limits are rejected before executing any database query.
+* **URL-Friendly Slugs:** Enforces lowercase alphanumeric kebab-case: `/^[a-z0-9]+(?:-[a-z0-9]+)*$/`.
+* **Clean Error Formatting:** Validation failures format issues into a `{ field, message }` array within the standard error envelope.
+
+---
+
+## Error Handling Standards
+
+All errors conform to a consistent JSON format:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "CATEGORY_HAS_PRODUCTS",
+    "message": "Cannot delete category \"Electronics\" because it has 3 associated product(s)"
+  }
+}
+```
+
+### Domain Error Codes
+
+| HTTP Status | Error Code | Trigger Condition |
 | :--- | :--- | :--- |
-| `Category -> Product` | `Restrict` | Prevents accidental deletion of categories that have active products. |
-| `Product -> OrderItem` | `Restrict` | **Strict financial compliance:** A product that was ordered by customers in historical orders cannot be deleted. If retired, set `isActive = false`. |
-| `Product -> Inventory` | `Restrict` | Protects against deleting products without properly reconciling or auditing inventory. |
-| `Product -> InventoryMovement`| `Restrict` | Inventory movements are immutable audit records; they must never be deleted. |
-| `Customer -> Order` | `Restrict` | A customer with historical transactions cannot be deleted. Financial and order records must remain intact. |
-| `User -> Customer` | `Restrict` | Prevents deletion of user credentials while an active customer profile exists. |
-| `Order -> OrderItem` | `Cascade` | Order items form a composite aggregate root with the parent order. |
-| `Order -> OrderStatusHistory` | `Cascade` | Status history belongs to the lifecycle of that specific order entity. |
-| `Order -> StockReservation` | `Restrict` | Prevents deleting an order with active stock holds. Reservations must be explicitly released or consumed. |
-| `Product -> StockReservation`| `Restrict` | Cannot delete a product while reservations are active. |
-| `Customer -> IdempotencyKey` | `Cascade` | Transient idempotency records may be cleaned up if a customer is ever purged. |
+| `400 Bad Request` | `VALIDATION_ERROR` | Request body, query, or params failed Zod schema checks. |
+| `400 Bad Request` | `INVALID_CATEGORY` | `categoryId` provided on product creation does not exist. |
+| `404 Not Found` | `CATEGORY_NOT_FOUND` | Category with the specified ID was not found. |
+| `404 Not Found` | `PRODUCT_NOT_FOUND` | Product with the specified ID was not found. |
+| `409 Conflict` | `DUPLICATE_CATEGORY` | Category name or slug is already taken. |
+| `409 Conflict` | `DUPLICATE_PRODUCT` | Product slug already exists. |
+| `409 Conflict` | `DUPLICATE_SKU` | Product SKU already exists. |
+| `409 Conflict` | `CATEGORY_HAS_PRODUCTS` | Attempted to delete a category that still contains products. |
+| `500 Internal Error`| `INTERNAL_SERVER_ERROR`| Uncaught system exception (sanitized in production). |
 
 ---
 
-### Indexing Strategy
-
-Indexes are applied intentionally based on anticipated production access patterns:
-
-* `Product.categoryId`: Efficient filtering of catalog items by category (`WHERE categoryId = ?`).
-* `Product.isActive`: Filtering active items in customer-facing storefronts (`WHERE isActive = true`).
-* `Product.createdAt`: Sorting by newest arrivals and supporting cursor-based pagination.
-* `Inventory.productId`: Fast `O(1)` index lookup for inventory checks during stock reservations and checkout.
-* `InventoryMovement.productId`: Retrieving full audit history of stock adjustments for a specific product.
-* `InventoryMovement.createdAt`: Date-range filtering and chronologically ordered inventory auditing.
-* `Order.customerId`: Fast order history lookup for customer dashboards (`WHERE customerId = ? ORDER BY createdAt DESC`).
-* `Order.status`: Operational queue queries for admin fulfillment dashboards (`WHERE status IN ('CONFIRMED', 'PROCESSING')`).
-* `Order.createdAt`: Financial period queries, analytics reporting, and paginated order listings.
-* `OrderItem.orderId`: Immediate retrieval of line items when fetching an order details page.
-* `OrderItem.productId`: Aggregating product sales and reporting on best-selling items.
-* `OrderStatusHistory.orderId`: Reconstructing chronological timeline for an order.
-* `OrderStatusHistory.changedAt`: Timeline sorting and SLA fulfillment duration analytics.
-* `StockReservation.orderId`: Resolving active reservations linked to a checkout session.
-* `StockReservation.productId`: Computing current net available inventory (`quantity - active reservations`).
-* `StockReservation.status`: Fast lookup of `ACTIVE` holds.
-* `StockReservation.expiresAt`: Supporting background worker queries to release expired reservations (`WHERE status = 'ACTIVE' AND expiresAt <= NOW()`).
-* `IdempotencyKey.[customerId, key]`: Unique composite index ensuring fast collision checks per customer.
-* `IdempotencyKey.expiresAt`: Enabling TTL purge routines to sweep expired keys.
-
----
-
-## Local Development Setup
-
-### Prerequisites
-
-- Node.js (v20.x or v22.x recommended)
-- npm (v10+ recommended)
-- PostgreSQL (v16+ running locally or in Docker on port `5432`)
-
-### 1. Clone & Install Dependencies
-
-```bash
-cd high-performance-order-api
-npm install
-```
-
-### 2. Environment Configuration
-
-Create or update `.env` file:
-
-```env
-NODE_ENV=development
-PORT=5000
-
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/order_api
-
-REDIS_HOST=localhost
-REDIS_PORT=6379
-
-JWT_SECRET=change-me
-```
-
-### 3. Database Migration & Seeding
-
-```bash
-# Generate Prisma Client
-npm run prisma:generate
-
-# Run migrations against PostgreSQL
-npm run prisma:migrate
-
-# Seed database with realistic development data
-npm run db:seed
-```
-
-### 4. Prisma Studio (Database GUI)
-
-```bash
-npm run prisma:studio
-```
-
----
-
-## How to Run the Project
-
-### Start in Development Mode (with hot-reload)
-
-```bash
-npm run dev
-```
-
-### Build for Production
-
-```bash
-npm run build
-```
-
-### Start in Production Mode
-
-```bash
-npm start
-```
+## Local Development & Testing
 
 ### Run Tests
 
@@ -379,77 +267,26 @@ npm start
 npm test
 ```
 
-### Run Linter & Formatter
+* Executes 32 automated integration tests across Health, Category, and Product suites using Jest & Supertest.
+
+### Start Development Server
 
 ```bash
-# Check linting
+npm run dev
+```
+
+### Production Build & Verification
+
+```bash
+# Type check without compilation
+npx tsc --noEmit
+
+# Production build
+npm run build
+
+# Linting
 npm run lint
 
-# Automatically fix lint issues
-npm run lint:fix
-
-# Format code
-npm run format
-
-# Check formatting
+# Code formatting check
 npm run format:check
-```
-
----
-
-## Health Endpoint
-
-A lightweight health check endpoint is available to monitor service availability:
-
-### Request
-
-```http
-GET /health
-Host: localhost:5000
-```
-
-### Response
-
-- **Status Code:** `200 OK`
-- **Content-Type:** `application/json`
-
-```json
-{
-  "status": "ok",
-  "service": "high-performance-order-api"
-}
-```
-
----
-
-## Error Handling Standard
-
-All application errors return a consistent and structured JSON response:
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": "RESOURCE_NOT_FOUND",
-    "message": "Route GET /unknown not found"
-  }
-}
-```
-
-When validation fails, an optional `details` array provides field-level feedback:
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Validation failed",
-    "details": [
-      {
-        "field": "email",
-        "message": "Invalid email address"
-      }
-    ]
-  }
-}
 ```
