@@ -9,6 +9,7 @@ import { categoryRouter } from './modules/categories/category.route';
 import { productRouter } from './modules/products/product.route';
 import { inventoryRouter } from './modules/inventory/inventory.route';
 import { orderRouter } from './modules/orders/order.route';
+import { authRouter } from './modules/auth/auth.route';
 
 export const createApp = (): Express => {
   const app = express();
@@ -24,6 +25,7 @@ export const createApp = (): Express => {
 
   // Application Routes
   app.use('/health', healthRouter);
+  app.use('/api/v1/auth', authRouter);
   app.use('/api/v1/categories', categoryRouter);
   app.use('/api/v1/products', productRouter);
   app.use('/api/v1/inventory', inventoryRouter);

@@ -2,9 +2,12 @@ import crypto from 'crypto';
 import {
   Inventory,
   InventoryMovementType,
+  Order,
+  OrderItem,
   OrderStatus,
   Prisma,
   ReservationStatus,
+  UserRole,
 } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { config } from '../../config/env';
@@ -16,6 +19,8 @@ import {
   IdempotencyKeyReusedError,
   InsufficientStockError,
   InventoryNotFoundError,
+  OrderAccessDeniedError,
+  OrderNotFoundError,
   ProductNotFoundError,
 } from '../../common/errors/app.error';
 import {
@@ -316,6 +321,35 @@ export class OrderService {
       );
       throw error;
     }
+  }
+
+  /**
+   * Retrieves an order by ID with ownership verification.
+   * If customer, order.customerId must match customer.id (enforces IDOR protection).
+   * Admins can access any order.
+   */
+  public async getOrderById(
+    orderId: string,
+    user: { id: string; role: UserRole }
+  ): Promise<Order & { items: OrderItem[] }> {
+    const order = await this.orderRepo.findById(orderId);
+    if (!order) {
+      throw new OrderNotFoundError(`Order with ID "${orderId}" not found`);
+    }
+
+    if (user.role !== UserRole.ADMIN) {
+      const customer = await prisma.customer.findUnique({
+        where: { userId: user.id },
+      });
+
+      if (!customer || order.customerId !== customer.id) {
+        throw new OrderAccessDeniedError(
+          'You do not have permission to access this order'
+        );
+      }
+    }
+
+    return order;
   }
 }
 

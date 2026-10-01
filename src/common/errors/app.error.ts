@@ -33,6 +33,19 @@ export enum ErrorCode {
   IDEMPOTENCY_KEY_REQUIRED = 'IDEMPOTENCY_KEY_REQUIRED',
   INVALID_IDEMPOTENCY_KEY = 'INVALID_IDEMPOTENCY_KEY',
   IDEMPOTENCY_KEY_REUSED = 'IDEMPOTENCY_KEY_REUSED',
+
+  // Authentication & Authorization Domain Errors
+  INVALID_CREDENTIALS = 'INVALID_CREDENTIALS',
+  EMAIL_ALREADY_EXISTS = 'EMAIL_ALREADY_EXISTS',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  INVALID_ACCESS_TOKEN = 'INVALID_ACCESS_TOKEN',
+  ACCESS_TOKEN_EXPIRED = 'ACCESS_TOKEN_EXPIRED',
+  INVALID_REFRESH_TOKEN = 'INVALID_REFRESH_TOKEN',
+  REFRESH_TOKEN_EXPIRED = 'REFRESH_TOKEN_EXPIRED',
+  REVOKED_REFRESH_TOKEN = 'REVOKED_REFRESH_TOKEN',
+  USER_NOT_FOUND = 'USER_NOT_FOUND',
+  ORDER_ACCESS_DENIED = 'ORDER_ACCESS_DENIED',
+  ORDER_NOT_FOUND = 'ORDER_NOT_FOUND',
 }
 
 export class AppError extends Error {
@@ -230,3 +243,68 @@ export class IdempotencyKeyReusedError extends AppError {
     super(409, ErrorCode.IDEMPOTENCY_KEY_REUSED, message, true);
   }
 }
+
+// ==========================================
+// Authentication & Authorization Domain Errors
+// ==========================================
+
+export class InvalidCredentialsError extends AppError {
+  constructor(message = 'Invalid email or password') {
+    super(401, ErrorCode.INVALID_CREDENTIALS, message, true);
+  }
+}
+
+export class EmailAlreadyExistsError extends AppError {
+  constructor(message = 'User with this email already exists') {
+    super(409, ErrorCode.EMAIL_ALREADY_EXISTS, message, true);
+  }
+}
+
+export class InvalidAccessTokenError extends AppError {
+  constructor(message = 'Invalid access token') {
+    super(401, ErrorCode.INVALID_ACCESS_TOKEN, message, true);
+  }
+}
+
+export class AccessTokenExpiredError extends AppError {
+  constructor(message = 'Access token has expired') {
+    super(401, ErrorCode.ACCESS_TOKEN_EXPIRED, message, true);
+  }
+}
+
+export class InvalidRefreshTokenError extends AppError {
+  constructor(message = 'Invalid refresh token') {
+    super(401, ErrorCode.INVALID_REFRESH_TOKEN, message, true);
+  }
+}
+
+export class RefreshTokenExpiredError extends AppError {
+  constructor(message = 'Refresh token has expired') {
+    super(401, ErrorCode.REFRESH_TOKEN_EXPIRED, message, true);
+  }
+}
+
+export class RevokedRefreshTokenError extends AppError {
+  constructor(message = 'Refresh token has been revoked') {
+    super(401, ErrorCode.REVOKED_REFRESH_TOKEN, message, true);
+  }
+}
+
+export class UserNotFoundError extends AppError {
+  constructor(message = 'User not found') {
+    super(404, ErrorCode.USER_NOT_FOUND, message, true);
+  }
+}
+
+export class OrderAccessDeniedError extends AppError {
+  constructor(message = 'You do not have permission to access this order') {
+    super(403, ErrorCode.ORDER_ACCESS_DENIED, message, true);
+  }
+}
+
+export class OrderNotFoundError extends AppError {
+  constructor(message = 'Order not found') {
+    super(404, ErrorCode.ORDER_NOT_FOUND, message, true);
+  }
+}
+

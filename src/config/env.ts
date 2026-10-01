@@ -13,6 +13,10 @@ const envSchema = z.object({
   REDIS_HOST: z.string().min(1).default('localhost'),
   REDIS_PORT: z.coerce.number().default(6379),
   JWT_SECRET: z.string().min(1).default('change-me'),
+  JWT_ACCESS_SECRET: z.string().min(1).default('access-secret-key-super-secure-min-32-chars'),
+  JWT_ACCESS_EXPIRES_IN: z.string().min(1).default('15m'),
+  JWT_REFRESH_SECRET: z.string().min(1).default('refresh-secret-key-super-secure-min-32-chars'),
+  JWT_REFRESH_EXPIRES_IN: z.string().min(1).default('7d'),
   STOCK_RESERVATION_MINUTES: z.coerce.number().int().positive().default(30),
   IDEMPOTENCY_KEY_TTL_HOURS: z.coerce.number().int().positive().default(24),
 });

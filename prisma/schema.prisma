@@ -47,14 +47,15 @@ enum ReservationStatus {
 // ==========================================
 
 model User {
-  id           String    @id @default(uuid())
-  email        String    @unique
+  id           String         @id @default(uuid())
+  email        String         @unique
   passwordHash String
-  role         UserRole  @default(CUSTOMER)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  role         UserRole       @default(CUSTOMER)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
 
   customer     Customer?
+  refreshTokens RefreshToken[]
 
   @@map("users")
 }
@@ -247,3 +248,24 @@ model IdempotencyKey {
   @@index([expiresAt])
   @@map("idempotency_keys")
 }
+
+// ==========================================
+// Authentication & Session Models
+// ==========================================
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+

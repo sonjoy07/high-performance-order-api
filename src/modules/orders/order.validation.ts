@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { CreateOrderItemInput } from './order.types';
 
 export const createOrderSchema = z.object({
-  customerId: z.string().uuid('Invalid customer ID format. Must be a valid UUID.'),
+  customerId: z.string().uuid('Invalid customer ID format. Must be a valid UUID.').optional(),
   items: z
     .array(
       z.object({

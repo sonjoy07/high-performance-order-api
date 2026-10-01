@@ -114,6 +114,18 @@ export class OrderRepository {
       },
     });
   }
+
+  /**
+   * Finds an order by its ID with nested order items.
+   */
+  public async findById(orderId: string): Promise<(Order & { items: OrderItem[] }) | null> {
+    return prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        items: true,
+      },
+    });
+  }
 }
 
 export const orderRepository = new OrderRepository();
