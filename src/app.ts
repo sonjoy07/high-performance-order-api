@@ -8,6 +8,7 @@ import { healthRouter } from './modules/health/health.route';
 import { categoryRouter } from './modules/categories/category.route';
 import { productRouter } from './modules/products/product.route';
 import { inventoryRouter } from './modules/inventory/inventory.route';
+import { orderRouter } from './modules/orders/order.route';
 
 export const createApp = (): Express => {
   const app = express();
@@ -26,6 +27,7 @@ export const createApp = (): Express => {
   app.use('/api/v1/categories', categoryRouter);
   app.use('/api/v1/products', productRouter);
   app.use('/api/v1/inventory', inventoryRouter);
+  app.use('/api/v1/orders', orderRouter);
 
   // 404 Not Found Middleware
   app.use(notFoundHandler);

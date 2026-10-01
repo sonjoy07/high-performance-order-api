@@ -120,6 +120,64 @@ export class InventoryRepository {
       return updatedInventory;
     });
   }
+
+  /**
+   * Locks a single inventory row using PostgreSQL row-level locking (SELECT ... FOR UPDATE)
+   * within an active transaction.
+   */
+  public async lockByProductId(
+    tx: Prisma.TransactionClient,
+    productId: string
+  ): Promise<Inventory | null> {
+    const rows = await tx.$queryRaw<Inventory[]>`
+      SELECT id, "productId", quantity, "reservedQuantity", version, "createdAt", "updatedAt"
+      FROM "inventories"
+      WHERE "productId" = ${productId}
+      FOR UPDATE
+    `;
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Atomically increments the reservedQuantity on an inventory row within an active transaction.
+   */
+  public async incrementReservedQuantity(
+    tx: Prisma.TransactionClient,
+    id: string,
+    quantity: number
+  ): Promise<Inventory> {
+    return tx.inventory.update({
+      where: { id },
+      data: {
+        reservedQuantity: { increment: quantity },
+        version: { increment: 1 },
+      },
+    });
+  }
+
+  /**
+   * Records an inventory movement audit trail within an active transaction.
+   */
+  public async createMovement(
+    tx: Prisma.TransactionClient,
+    data: {
+      productId: string;
+      type: InventoryMovementType;
+      quantity: number;
+      referenceType: string;
+      referenceId?: string | null;
+    }
+  ): Promise<InventoryMovement> {
+    return tx.inventoryMovement.create({
+      data: {
+        productId: data.productId,
+        type: data.type,
+        quantity: data.quantity,
+        referenceType: data.referenceType,
+        referenceId: data.referenceId ?? null,
+      },
+    });
+  }
 }
 
 export const inventoryRepository = new InventoryRepository();

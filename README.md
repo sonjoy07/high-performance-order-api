@@ -78,12 +78,19 @@ high-performance-order-api/
 │   │   │   ├── product.route.ts
 │   │   │   ├── product.service.ts
 │   │   │   └── product.validation.ts
-│   │   └── inventory/           # Inventory & stock tracking module
-│   │       ├── inventory.controller.ts
-│   │       ├── inventory.repository.ts
-│   │       ├── inventory.route.ts
-│   │       ├── inventory.service.ts
-│   │       └── inventory.validation.ts
+│   │   ├── inventory/           # Inventory & stock tracking module
+│   │   │   ├── inventory.controller.ts
+│   │   │   ├── inventory.repository.ts
+│   │   │   ├── inventory.route.ts
+│   │   │   ├── inventory.service.ts
+│   │   │   └── inventory.validation.ts
+│   │   └── orders/              # Order creation, reservation & concurrency module
+│   │       ├── order.controller.ts
+│   │       ├── order.repository.ts
+│   │       ├── order.route.ts
+│   │       ├── order.service.ts
+│   │       ├── order.types.ts
+│   │       └── order.validation.ts
 │   ├── jobs/                    # BullMQ job workers and consumers (for future phases)
 │   ├── queues/                  # BullMQ queue producers and definitions (for future phases)
 │   ├── events/                  # Domain events and pub/sub handlers (for future phases)
@@ -93,6 +100,7 @@ high-performance-order-api/
 │   ├── category.test.ts         # Category API integration tests
 │   ├── health.test.ts           # Health & 404 integration tests
 │   ├── inventory.test.ts        # Inventory & Concurrency integration tests
+│   ├── order.test.ts            # Order Creation & Concurrency integration tests
 │   └── product.test.ts          # Product API integration tests
 ├── .env                         # Local environment configuration
 ├── .env.example                 # Template for required environment variables
@@ -233,6 +241,147 @@ Every stock modification creates an immutable ledger entry recording:
 
 ---
 
+## Order API & Concurrency Control
+
+Base path: `/api/v1/orders`
+
+| Method | Endpoint | Description | Status Code |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/orders` | Create order, lock rows, reserve stock & log audit history | `201 Created` |
+
+### Request Format
+```json
+{
+  "customerId": "8f3e2b1a-9876-4321-bcde-1234567890ab",
+  "items": [
+    {
+      "productId": "ee13d707-3121-4870-adaf-8171443ac14b",
+      "quantity": 2
+    },
+    {
+      "productId": "9cbedf09-5dc5-41f6-8564-3c342d1f9a28",
+      "quantity": 1
+    }
+  ]
+}
+```
+
+### Response Format (`201 Created`)
+```json
+{
+  "success": true,
+  "data": {
+    "id": "e45bf90a-1234-4567-89ab-cdef01234567",
+    "orderNumber": "ORD-20261002-7F3A9D1B",
+    "status": "PENDING",
+    "totalAmount": "259.98",
+    "items": [
+      {
+        "productId": "ee13d707-3121-4870-adaf-8171443ac14b",
+        "quantity": 2,
+        "unitPrice": "100.00",
+        "totalPrice": "200.00"
+      },
+      {
+        "productId": "9cbedf09-5dc5-41f6-8564-3c342d1f9a28",
+        "quantity": 1,
+        "unitPrice": "59.98",
+        "totalPrice": "59.98"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### Order Creation Flow
+
+```text
+Request (customerId, items)
+   ↓
+Validate Payload (Zod schema: UUID format, non-empty array, quantity > 0)
+   ↓
+Normalize Items (Merge duplicate product IDs by summing quantities)
+   ↓
+Sort Product IDs Ascending (Global Lock Ordering / Deadlock Prevention)
+   ↓
+BEGIN TRANSACTION
+   │
+   ├── Step 1: Validate customer exists (404 CUSTOMER_NOT_FOUND)
+   │
+   ├── Step 2: Validate products exist and are active (404 PRODUCT_NOT_FOUND)
+   │
+   ├── Step 3: Lock inventory rows deterministically (SELECT ... FOR UPDATE)
+   │
+   ├── Step 4: Check available stock (available = quantity - reservedQuantity)
+   │           └── If requested > available: Abort & Rollback (409 INSUFFICIENT_STOCK)
+   │
+   ├── Step 5: Compute historical prices & order totals (Arbitrary-precision Decimals)
+   │
+   ├── Step 6: Create Order (status: PENDING, unique orderNumber)
+   │
+   ├── Step 7: Create OrderItems (freezing unitPrice at order creation time)
+   │
+   ├── Step 8: Update Inventory (reservedQuantity += requestedQuantity)
+   │
+   ├── Step 9: Create StockReservations (status: ACTIVE, expiresAt configured)
+   │
+   ├── Step 10: Create InventoryMovements (type: RESERVATION, referenceType: ORDER)
+   │
+   ├── Step 11: Create OrderStatusHistory (fromStatus: null, toStatus: PENDING)
+   │
+   └── COMMIT TRANSACTION
+```
+
+---
+
+### Architecture & Concurrency Design Deep-Dive
+
+#### 1. Why `FOR UPDATE`?
+Without pessimistic row locking, simultaneous requests experience classic **lost updates** and **read-skew anomalies**:
+1. Client A and Client B both read Product X stock with $\text{available} = 5$.
+2. Client A requests 4 units; Client B requests 4 units.
+3. Both pass the application availability check ($4 \le 5$).
+4. Both commit, pushing $\text{reservedQuantity} = 8$ against physical stock of $5$ (causing negative available stock $-3$ and overselling).
+
+Executing `SELECT ... FOR UPDATE` acquires an exclusive row-level lock on the `inventories` record. Competing transactions requesting the same row are forced to queue at the database level until the holding transaction commits or rolls back. When a queued transaction is granted the lock, it immediately reads the freshly committed stock values, reliably evaluating stock reality.
+
+#### 2. Why ONE Transaction?
+Order placement touches six related tables: `orders`, `order_items`, `inventories`, `stock_reservations`, `inventory_movements`, and `order_status_history`. Wrapping these operations in a single atomic PostgreSQL transaction ensures **Atomicity and Consistency (ACID)**. If any precondition fails (e.g. one item out of five lacks stock, or a database constraint fails), the entire transaction rolls back. No partial orders, unreserved items, orphan ledger entries, or phantom inventory locks are left behind.
+
+#### 3. Why Deterministic Lock Ordering?
+When multi-item orders lock rows dynamically in user-supplied request order, **deadlocks** are inevitable under concurrent load:
+* **Transaction 1:** Locks Product A $\to$ attempts to lock Product B.
+* **Transaction 2:** Locks Product B $\to$ attempts to lock Product A.
+* Both transactions block waiting for the other to release its lock, forming a cyclic dependency. PostgreSQL terminates one transaction with a `40P01 (deadlock_detected)` error.
+
+By sorting all `productId`s alphabetically (ascending) before acquiring any row locks, all transactions acquire locks in the identical order ($A \to B \to C$). The wait-for graph is strictly directed and acyclic ($DAG$), mathematically eliminating deadlocks.
+
+#### 4. Why Reservation Instead of Reducing Physical Quantity?
+Physical quantity ($\text{quantity}$) reflects actual items stored in the warehouse bin. When an order is placed, goods are not yet picked or shipped; they are merely held while checkout completes. 
+* Decreasing physical stock immediately leads to discrepancies during warehouse cycle counts and physical audits.
+* By isolating $\text{reservedQuantity}$, available stock is dynamically derived ($\text{availableQuantity} = \text{quantity} - \text{reservedQuantity}$).
+* If an order expires, cancels, or fails payment, the reservation is released ($\text{reservedQuantity} -= \text{held}$) without touching physical warehouse ledger counts. When the order is eventually packed and fulfilled, physical quantity is decremented alongside reservation consumption.
+
+#### 5. How Does the System Prevent Overselling?
+Overselling prevention is guaranteed by the combination of:
+1. **Pessimistic serialization:** `SELECT ... FOR UPDATE` serializes access per inventory row.
+2. **Fresh evaluated state:** Stock availability ($\text{quantity} - \text{reservedQuantity} \ge \text{requested}$) is verified after the lock is acquired.
+3. **Database check constraints:** Enforced non-negative boundaries in PostgreSQL ensure `reservedQuantity` can never exceed `quantity`.
+4. **All-or-nothing rollback:** If any item fails, zero inventory is claimed.
+
+#### 6. What Happens When One Product Has Insufficient Stock?
+In a multi-product order (e.g., ordering 2 units of Product A and 1000 units of Product B):
+1. Product A is locked and validated (available).
+2. Product B is locked; availability check detects insufficient stock.
+3. An `InsufficientStockError (409)` is thrown.
+4. Prisma aborts the transaction and issues an immediate `ROLLBACK` to PostgreSQL.
+5. All acquired row locks on Product A and Product B are released.
+6. Neither Product A nor Product B has its `reservedQuantity` incremented; no order records, items, reservations, or audit movements are committed.
+
+---
+
 ## Error Handling Standards
 
 All errors return uniform JSON responses:
@@ -242,7 +391,7 @@ All errors return uniform JSON responses:
   "success": false,
   "error": {
     "code": "INSUFFICIENT_STOCK",
-    "message": "Insufficient available stock for product \"b7fe631a\""
+    "message": "Insufficient stock for product Wireless Headphones"
   }
 }
 ```
@@ -251,17 +400,20 @@ All errors return uniform JSON responses:
 
 | HTTP Status | Error Code | Trigger Condition |
 | :--- | :--- | :--- |
-| `400 Bad Request` | `VALIDATION_ERROR` | Schema validation failed (e.g. quantity $\le 0$). |
+| `400 Bad Request` | `VALIDATION_ERROR` | Schema validation failed (e.g. quantity $\le 0$, invalid UUID). |
 | `400 Bad Request` | `INVALID_CATEGORY` | `categoryId` provided on product creation does not exist. |
+| `400 Bad Request` | `INVALID_ORDER` | Malformed order data. |
 | `404 Not Found` | `PRODUCT_NOT_FOUND` | Product ID does not exist in database. |
+| `404 Not Found` | `CUSTOMER_NOT_FOUND`| Customer ID does not exist in database. |
 | `404 Not Found` | `CATEGORY_NOT_FOUND` | Category ID does not exist. |
 | `404 Not Found` | `INVENTORY_NOT_FOUND` | Product exists but has no inventory record. |
-| `409 Conflict` | `INSUFFICIENT_STOCK` | Requested stock-out exceeds available stock ($\text{quantity} - \text{reserved}$). |
+| `409 Conflict` | `INSUFFICIENT_STOCK` | Requested quantity exceeds available stock ($\text{quantity} - \text{reservedQuantity}$). |
 | `409 Conflict` | `INVENTORY_BELOW_RESERVED_STOCK` | Target adjustment is lower than current `reservedQuantity`. |
 | `409 Conflict` | `DUPLICATE_CATEGORY` | Category name or slug already in use. |
 | `409 Conflict` | `DUPLICATE_PRODUCT` | Product slug already in use. |
 | `409 Conflict` | `DUPLICATE_SKU` | Product SKU already in use. |
 | `409 Conflict` | `CATEGORY_HAS_PRODUCTS` | Attempted deletion of category with assigned products. |
+| `500 Internal Error`| `ORDER_CREATION_FAILED` | Internal error while processing order creation. |
 | `500 Internal Error`| `INTERNAL_SERVER_ERROR`| Uncaught system exception. |
 
 ---
@@ -274,7 +426,9 @@ All errors return uniform JSON responses:
 npm test
 ```
 
-* **46 automated integration tests** across Health, Category, Product, and Inventory suites.
+* **58 automated integration tests** across Health, Category, Product, Inventory, and Order suites.
+* Includes real concurrent race condition verification under PostgreSQL row-level locking.
+
 * Includes real concurrent race condition verification under PostgreSQL row-level locking.
 
 ### Start Development Server

@@ -79,6 +79,27 @@ export class ProductRepository {
     });
   }
 
+  public async findByIds(
+    ids: string[],
+    tx?: Prisma.TransactionClient
+  ): Promise<ProductWithCategory[]> {
+    const client = tx ?? prisma;
+    return client.product.findMany({
+      where: {
+        id: { in: ids },
+      },
+      include: {
+        category: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+          },
+        },
+      },
+    });
+  }
+
   public async findBySku(sku: string): Promise<Product | null> {
     return prisma.product.findUnique({
       where: { sku },

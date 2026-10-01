@@ -23,6 +23,11 @@ export enum ErrorCode {
   INSUFFICIENT_STOCK = 'INSUFFICIENT_STOCK',
   INVENTORY_BELOW_RESERVED_STOCK = 'INVENTORY_BELOW_RESERVED_STOCK',
   INVALID_STOCK_ADJUSTMENT = 'INVALID_STOCK_ADJUSTMENT',
+
+  // Customer & Order Domain Errors
+  CUSTOMER_NOT_FOUND = 'CUSTOMER_NOT_FOUND',
+  INVALID_ORDER = 'INVALID_ORDER',
+  ORDER_CREATION_FAILED = 'ORDER_CREATION_FAILED',
 }
 
 export class AppError extends Error {
@@ -174,5 +179,27 @@ export class InventoryBelowReservedStockError extends AppError {
 export class InvalidStockAdjustmentError extends AppError {
   constructor(message = 'Invalid stock adjustment') {
     super(400, ErrorCode.INVALID_STOCK_ADJUSTMENT, message, true);
+  }
+}
+
+// ==========================================
+// Customer & Order Domain Errors
+// ==========================================
+
+export class CustomerNotFoundError extends AppError {
+  constructor(message = 'Customer not found') {
+    super(404, ErrorCode.CUSTOMER_NOT_FOUND, message, true);
+  }
+}
+
+export class InvalidOrderError extends AppError {
+  constructor(message = 'Invalid order data', details?: unknown) {
+    super(400, ErrorCode.INVALID_ORDER, message, true, details);
+  }
+}
+
+export class OrderCreationFailedError extends AppError {
+  constructor(message = 'Failed to create order', details?: unknown) {
+    super(500, ErrorCode.ORDER_CREATION_FAILED, message, false, details);
   }
 }
