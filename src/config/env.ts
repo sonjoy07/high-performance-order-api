@@ -14,6 +14,7 @@ const envSchema = z.object({
   REDIS_PORT: z.coerce.number().default(6379),
   JWT_SECRET: z.string().min(1).default('change-me'),
   STOCK_RESERVATION_MINUTES: z.coerce.number().int().positive().default(30),
+  IDEMPOTENCY_KEY_TTL_HOURS: z.coerce.number().int().positive().default(24),
 });
 
 const parseEnv = () => {

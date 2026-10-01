@@ -28,6 +28,11 @@ export enum ErrorCode {
   CUSTOMER_NOT_FOUND = 'CUSTOMER_NOT_FOUND',
   INVALID_ORDER = 'INVALID_ORDER',
   ORDER_CREATION_FAILED = 'ORDER_CREATION_FAILED',
+
+  // Idempotency Domain Errors
+  IDEMPOTENCY_KEY_REQUIRED = 'IDEMPOTENCY_KEY_REQUIRED',
+  INVALID_IDEMPOTENCY_KEY = 'INVALID_IDEMPOTENCY_KEY',
+  IDEMPOTENCY_KEY_REUSED = 'IDEMPOTENCY_KEY_REUSED',
 }
 
 export class AppError extends Error {
@@ -201,5 +206,27 @@ export class InvalidOrderError extends AppError {
 export class OrderCreationFailedError extends AppError {
   constructor(message = 'Failed to create order', details?: unknown) {
     super(500, ErrorCode.ORDER_CREATION_FAILED, message, false, details);
+  }
+}
+
+// ==========================================
+// Idempotency Domain Errors
+// ==========================================
+
+export class IdempotencyKeyRequiredError extends AppError {
+  constructor(message = 'Idempotency-Key header is required') {
+    super(400, ErrorCode.IDEMPOTENCY_KEY_REQUIRED, message, true);
+  }
+}
+
+export class InvalidIdempotencyKeyError extends AppError {
+  constructor(message = 'Idempotency-Key header must be between 1 and 255 characters') {
+    super(400, ErrorCode.INVALID_IDEMPOTENCY_KEY, message, true);
+  }
+}
+
+export class IdempotencyKeyReusedError extends AppError {
+  constructor(message = 'The idempotency key was already used with a different request') {
+    super(409, ErrorCode.IDEMPOTENCY_KEY_REUSED, message, true);
   }
 }

@@ -11,11 +11,12 @@ export class OrderController {
     next: NextFunction
   ): Promise<void> => {
     try {
-      const order = await this.orderService.createOrder(req.body);
+      const idempotencyKey = req.headers['idempotency-key'];
+      const result = await this.orderService.createOrder(req.body, idempotencyKey);
 
-      res.status(201).json({
+      res.status(result.statusCode).json({
         success: true,
-        data: order,
+        data: result.data,
       });
     } catch (error) {
       next(error);

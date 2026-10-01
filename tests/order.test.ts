@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import request from 'supertest';
+import crypto from 'crypto';
 import { app } from '../src/app';
 import { prisma } from '../src/config/prisma';
 
@@ -144,6 +145,9 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     await prisma.stockReservation.deleteMany({
       where: { productId: { in: productIds } },
     });
+    await prisma.idempotencyKey.deleteMany({
+      where: { customerId: testCustomerId },
+    });
     await prisma.orderStatusHistory.deleteMany({
       where: { order: { customerId: testCustomerId } },
     });
@@ -177,10 +181,13 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
 
   describe('Validation & Precondition Checks', () => {
     it('should reject order with empty items array with 400 VALIDATION_ERROR', async () => {
-      const response = await request(app).post('/api/v1/orders').send({
-        customerId: testCustomerId,
-        items: [],
-      });
+      const response = await request(app)
+        .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
+        .send({
+          customerId: testCustomerId,
+          items: [],
+        });
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -190,6 +197,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should reject order with non-positive quantity with 400 VALIDATION_ERROR', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 0 }],
@@ -203,6 +211,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should reject order with invalid customerId format with 400 VALIDATION_ERROR', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: 'not-a-uuid',
           items: [{ productId: productAId, quantity: 1 }],
@@ -217,6 +226,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       const nonExistentCustomerId = '00000000-0000-0000-0000-000000000000';
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: nonExistentCustomerId,
           items: [{ productId: productAId, quantity: 1 }],
@@ -231,6 +241,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       const nonExistentProductId = '00000000-0000-0000-0000-000000000000';
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: testCustomerId,
           items: [{ productId: nonExistentProductId, quantity: 1 }],
@@ -244,6 +255,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should return 404 INVENTORY_NOT_FOUND when product has no inventory record', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: testCustomerId,
           items: [{ productId: productNoInvId, quantity: 1 }],
@@ -259,6 +271,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
     it('should merge duplicate product IDs into a single item with summed quantity before transaction', async () => {
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: testCustomerId,
           items: [
@@ -293,6 +306,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       // productB current: qty 25, res 5, available = 20. We request 3.
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: testCustomerId,
           items: [
@@ -343,6 +357,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       // 1. Create order when product A price is 100.00
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: testCustomerId,
           items: [{ productId: productAId, quantity: 1 }],
@@ -383,6 +398,7 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       // Request Product A (2 units - AVAILABLE) and Product B (1000 units - INSUFFICIENT)
       const response = await request(app)
         .post('/api/v1/orders')
+        .set('Idempotency-Key', crypto.randomUUID())
         .send({
           customerId: testCustomerId,
           items: [
@@ -424,16 +440,18 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       expect(initialInv?.quantity).toBe(1);
       expect(initialInv?.reservedQuantity).toBe(0);
 
-      // Send 2 concurrent requests simultaneously for quantity = 1
+      // Send 2 concurrent requests simultaneously for quantity = 1 (different idempotency keys)
       const requests = [
         request(app)
           .post('/api/v1/orders')
+          .set('Idempotency-Key', crypto.randomUUID())
           .send({
             customerId: testCustomerId,
             items: [{ productId: singleStockProductId, quantity: 1 }],
           }),
         request(app)
           .post('/api/v1/orders')
+          .set('Idempotency-Key', crypto.randomUUID())
           .send({
             customerId: testCustomerId,
             items: [{ productId: singleStockProductId, quantity: 1 }],
@@ -471,10 +489,11 @@ describe('Order Creation & Stock Reservation APIs (/api/v1/orders)', () => {
       expect(initialInv?.quantity).toBe(10);
       expect(initialInv?.reservedQuantity).toBe(0);
 
-      // Send 10 concurrent requests for quantity = 2 (Attempted total: 20 units)
+      // Send 10 concurrent requests for quantity = 2 (each with its own unique idempotency key)
       const requests = Array.from({ length: 10 }, () =>
         request(app)
           .post('/api/v1/orders')
+          .set('Idempotency-Key', crypto.randomUUID())
           .send({
             customerId: testCustomerId,
             items: [{ productId: tenStockProductId, quantity: 2 }],

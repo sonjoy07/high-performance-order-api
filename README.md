@@ -84,13 +84,18 @@ high-performance-order-api/
 │   │   │   ├── inventory.route.ts
 │   │   │   ├── inventory.service.ts
 │   │   │   └── inventory.validation.ts
-│   │   └── orders/              # Order creation, reservation & concurrency module
-│   │       ├── order.controller.ts
-│   │       ├── order.repository.ts
-│   │       ├── order.route.ts
-│   │       ├── order.service.ts
-│   │       ├── order.types.ts
-│   │       └── order.validation.ts
+│   │   ├── orders/              # Order creation, reservation & concurrency module
+│   │   │   ├── order.controller.ts
+│   │   │   ├── order.repository.ts
+│   │   │   ├── order.route.ts
+│   │   │   ├── order.service.ts
+│   │   │   ├── order.types.ts
+│   │   │   └── order.validation.ts
+│   │   └── idempotency/         # Header validation, hashing & idempotency repository
+│   │       ├── idempotency.repository.ts
+│   │       ├── idempotency.service.ts
+│   │       ├── idempotency.types.ts
+│   │       └── idempotency.utils.ts
 │   ├── jobs/                    # BullMQ job workers and consumers (for future phases)
 │   ├── queues/                  # BullMQ queue producers and definitions (for future phases)
 │   ├── events/                  # Domain events and pub/sub handlers (for future phases)
@@ -99,6 +104,7 @@ high-performance-order-api/
 ├── tests/                       # Automated test suites (Jest + Supertest)
 │   ├── category.test.ts         # Category API integration tests
 │   ├── health.test.ts           # Health & 404 integration tests
+│   ├── idempotency.test.ts      # Idempotency & Replay integration tests
 │   ├── inventory.test.ts        # Inventory & Concurrency integration tests
 │   ├── order.test.ts            # Order Creation & Concurrency integration tests
 │   └── product.test.ts          # Product API integration tests
@@ -382,6 +388,74 @@ In a multi-product order (e.g., ordering 2 units of Product A and 1000 units of 
 
 ---
 
+## Idempotency & Safe Request Retries
+
+The order creation endpoint is protected by database-enforced idempotency to prevent duplicate orders caused by client retries, network timeouts, or double clicks.
+
+### Why Idempotency?
+In distributed network systems, network connections can drop after the server has processed an order but before the client receives the response. Without idempotency, client retries or automatic network resends would create duplicate orders and multiple stock reservations.
+
+### How It Works
+
+```text
+Client Request (with Idempotency-Key header)
+  ↓
+Validate Header (non-empty string, max 255 chars)
+  ↓
+Compute Canonical Request Hash (SHA-256 of customerId and normalized items)
+  ↓
+Check Existing Key (customerId + key)
+  ├── Existing + Same Hash: Return cached original response (201 Created)
+  ├── Existing + Different Hash: Reject with 409 IDEMPOTENCY_KEY_REUSED
+  └── New / Expired:
+       ↓
+  Begin PostgreSQL Transaction
+       ↓
+  Validate Customer
+       ↓
+  Claim Idempotency Key (INSERT into idempotency_keys)
+       ↓
+  Lock Inventory (SELECT ... FOR UPDATE)
+       ↓
+  Validate Stock Availability
+       ↓
+  Create Order & OrderItems
+       ↓
+  Create StockReservations & Movements
+       ↓
+  Store Response in Idempotency Record (responseStatus, responseBody)
+       ↓
+  COMMIT
+       ↓
+  Return Order Response
+```
+
+### Same Key + Same Request (Replay)
+When the client retries with the same `Idempotency-Key` and an identical or semantically equivalent payload (e.g. rearranged items or unmerged duplicates that resolve to the same canonical structure), the server returns the cached response with the original HTTP status (`201 Created`). No duplicate orders or additional stock reservations are created.
+
+### Same Key + Different Request (409 Conflict)
+If a client attempts to reuse an existing `Idempotency-Key` with a different payload (e.g. altered quantity or different product IDs), the request is rejected with `409 Conflict` and code `IDEMPOTENCY_KEY_REUSED`. This prevents accidental collisions and misuse.
+
+### Concurrent Duplicate Requests (Unique Constraint Synchronization)
+When multiple concurrent requests arrive with the exact same `(customerId, key)` at the exact same millisecond:
+1. Both attempt to insert into `idempotency_keys` inside their respective transactions.
+2. PostgreSQL's unique constraint (`@@unique([customerId, key])`) serializes the transactions: the first transaction claims the row; subsequent transactions pause and block on the unique index lock.
+3. When the first transaction commits with the completed response, the waiting transactions unblock and encounter a unique constraint violation (`P2002`).
+4. The waiting transactions catch the conflict, query the committed response, verify the request hash, and return the exact same `201 Created` response.
+5. Exactly one order is created in the database.
+
+### Failed Transactions (No Poisoned Keys)
+If an order fails (e.g. `INSUFFICIENT_STOCK` or validation failure):
+1. The transaction issues an immediate `ROLLBACK`.
+2. The tentative `IdempotencyKey` record is rolled back alongside the rest of the transaction.
+3. The key is not poisoned. The client is free to retry with the same key once the underlying issue is resolved.
+
+### Key Expiration (TTL)
+* Idempotency keys have a configurable Time-To-Live (`IDEMPOTENCY_KEY_TTL_HOURS`, default: `24` hours).
+* Expired keys encountered during request evaluation are automatically removed and treated as fresh keys.
+
+---
+
 ## Error Handling Standards
 
 All errors return uniform JSON responses:
@@ -401,12 +475,15 @@ All errors return uniform JSON responses:
 | HTTP Status | Error Code | Trigger Condition |
 | :--- | :--- | :--- |
 | `400 Bad Request` | `VALIDATION_ERROR` | Schema validation failed (e.g. quantity $\le 0$, invalid UUID). |
+| `400 Bad Request` | `IDEMPOTENCY_KEY_REQUIRED` | Missing or empty `Idempotency-Key` header. |
+| `400 Bad Request` | `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` exceeds 255 characters or is invalid type. |
 | `400 Bad Request` | `INVALID_CATEGORY` | `categoryId` provided on product creation does not exist. |
 | `400 Bad Request` | `INVALID_ORDER` | Malformed order data. |
 | `404 Not Found` | `PRODUCT_NOT_FOUND` | Product ID does not exist in database. |
 | `404 Not Found` | `CUSTOMER_NOT_FOUND`| Customer ID does not exist in database. |
 | `404 Not Found` | `CATEGORY_NOT_FOUND` | Category ID does not exist. |
 | `404 Not Found` | `INVENTORY_NOT_FOUND` | Product exists but has no inventory record. |
+| `409 Conflict` | `IDEMPOTENCY_KEY_REUSED` | Idempotency key reused with a different request payload. |
 | `409 Conflict` | `INSUFFICIENT_STOCK` | Requested quantity exceeds available stock ($\text{quantity} - \text{reservedQuantity}$). |
 | `409 Conflict` | `INVENTORY_BELOW_RESERVED_STOCK` | Target adjustment is lower than current `reservedQuantity`. |
 | `409 Conflict` | `DUPLICATE_CATEGORY` | Category name or slug already in use. |
@@ -426,10 +503,8 @@ All errors return uniform JSON responses:
 npm test
 ```
 
-* **58 automated integration tests** across Health, Category, Product, Inventory, and Order suites.
-* Includes real concurrent race condition verification under PostgreSQL row-level locking.
-
-* Includes real concurrent race condition verification under PostgreSQL row-level locking.
+* **67 automated integration tests** across Health, Category, Product, Inventory, Order, and Idempotency suites.
+* Includes real concurrent race condition verification under PostgreSQL row-level locking and unique constraint serialization.
 
 ### Start Development Server
 
@@ -445,3 +520,4 @@ npm run lint
 npm run format:check
 npm run build
 ```
+

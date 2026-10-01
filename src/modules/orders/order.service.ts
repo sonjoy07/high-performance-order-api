@@ -13,6 +13,7 @@ import {
   AppError,
   BusinessLogicError,
   CustomerNotFoundError,
+  IdempotencyKeyReusedError,
   InsufficientStockError,
   InventoryNotFoundError,
   ProductNotFoundError,
@@ -25,15 +26,30 @@ import {
   ProductRepository,
   productRepository as defaultProductRepo,
 } from '../products/product.repository';
+import {
+  IdempotencyRepository,
+  idempotencyRepository as defaultIdempotencyRepo,
+} from '../idempotency/idempotency.repository';
+import {
+  IdempotencyService,
+  idempotencyService as defaultIdempotencyService,
+} from '../idempotency/idempotency.service';
 import { OrderRepository, orderRepository as defaultOrderRepo } from './order.repository';
 import { CreateOrderInput, OrderResponseView } from './order.types';
 import { mergeAndSortOrderItems } from './order.validation';
+
+export interface CreateOrderResult {
+  statusCode: number;
+  data: OrderResponseView;
+}
 
 export class OrderService {
   constructor(
     private readonly orderRepo: OrderRepository = defaultOrderRepo,
     private readonly productRepo: ProductRepository = defaultProductRepo,
-    private readonly inventoryRepo: InventoryRepository = defaultInventoryRepo
+    private readonly inventoryRepo: InventoryRepository = defaultInventoryRepo,
+    private readonly idempotencyRepo: IdempotencyRepository = defaultIdempotencyRepo,
+    private readonly idempotencyService: IdempotencyService = defaultIdempotencyService
   ) {}
 
   /**
@@ -47,27 +63,61 @@ export class OrderService {
   }
 
   /**
-   * Coordinates the complete order creation and stock reservation workflow inside ONE PostgreSQL transaction.
+   * Coordinates idempotent order creation and stock reservation inside ONE PostgreSQL transaction.
    *
-   * Transaction Flow:
-   * 1. Normalize items: Merge duplicates and sort product IDs deterministically (Deadlock Prevention).
-   * 2. BEGIN TRANSACTION
-   * 3. Validate customer exists.
-   * 4. Verify products exist and retrieve historical catalog prices.
-   * 5. Lock inventory rows using SELECT ... FOR UPDATE in deterministic order.
-   * 6. Validate stock availability (availableQuantity = quantity - reservedQuantity).
-   * 7. Calculate total order amount with Decimal precision.
-   * 8. Create Order and OrderItems (storing unitPrice at creation time).
-   * 9. Increment reservedQuantity (physical stock is preserved).
-   * 10. Create StockReservation records with configured expiration time.
-   * 11. Create InventoryMovement records (type: RESERVATION, referenceType: ORDER).
-   * 12. Create OrderStatusHistory record (fromStatus: null, toStatus: PENDING).
-   * 13. COMMIT TRANSACTION
+   * Idempotency & Transaction Flow:
+   * 1. Validate Idempotency-Key header & compute deterministic request hash (SHA-256).
+   * 2. Check for existing completed idempotency record:
+   *    - If same key + same hash: return stored response (replay).
+   *    - If same key + different hash: throw 409 IDEMPOTENCY_KEY_REUSED.
+   * 3. Normalize items: Merge duplicate products and sort product IDs deterministically (Deadlock Prevention).
+   * 4. BEGIN TRANSACTION
+   *    - Step A: Claim idempotency key row.
+   *    - Step B: Validate customer exists.
+   *    - Step C: Verify products exist and retrieve historical catalog prices.
+   *    - Step D: Lock inventory rows using SELECT ... FOR UPDATE in deterministic order.
+   *    - Step E: Validate stock availability (availableQuantity = quantity - reservedQuantity).
+   *    - Step F: Calculate total order amount with Decimal precision.
+   *    - Step G: Create Order and OrderItems (freezing unitPrice at order creation time).
+   *    - Step H: Increment reservedQuantity (physical stock is preserved).
+   *    - Step I: Create StockReservation records with configured expiration time.
+   *    - Step J: Create InventoryMovement records (type: RESERVATION, referenceType: ORDER).
+   *    - Step K: Create OrderStatusHistory record (fromStatus: null, toStatus: PENDING).
+   *    - Step L: Store response body & status in idempotency record.
+   * 5. COMMIT TRANSACTION
    */
-  public async createOrder(input: CreateOrderInput): Promise<OrderResponseView> {
-    // 1. Normalize and merge duplicate product IDs, then sort deterministically by productId
+  public async createOrder(
+    input: CreateOrderInput,
+    idempotencyKeyHeader: unknown
+  ): Promise<CreateOrderResult> {
+    // 1. Validate header, canonicalize payload, and compute deterministic request hash
+    const { key, requestHash } = this.idempotencyService.prepareIdempotency(
+      idempotencyKeyHeader,
+      input.customerId,
+      input.items
+    );
+
+    // 2. Fast-path check: Check if an identical request was already successfully processed
+    const existing = await this.idempotencyService.checkExisting<OrderResponseView>(
+      input.customerId,
+      key,
+      requestHash
+    );
+    if (existing) {
+      logger.info(
+        { customerId: input.customerId, key, orderId: existing.data.id },
+        'Idempotent request replay: returning previously stored order response'
+      );
+      return {
+        statusCode: existing.statusCode,
+        data: existing.data,
+      };
+    }
+
+    // 3. Normalize and merge duplicate product IDs, then sort deterministically by productId
     const mergedItems = mergeAndSortOrderItems(input.items);
     const sortedProductIds = mergedItems.map((item) => item.productId);
+    const idempotencyExpiresAt = this.idempotencyService.getExpirationDate();
 
     try {
       return await prisma.$transaction(async (tx) => {
@@ -77,7 +127,15 @@ export class OrderService {
           throw new CustomerNotFoundError(`Customer with ID "${input.customerId}" not found`);
         }
 
-        // Step B: Verify products exist & retrieve historical prices
+        // Step B: Claim/insert the idempotency record inside the transaction
+        await this.idempotencyRepo.createKey(tx, {
+          key,
+          customerId: input.customerId,
+          requestHash,
+          expiresAt: idempotencyExpiresAt,
+        });
+
+        // Step C: Verify products exist & retrieve historical prices
         const products = await this.productRepo.findByIds(sortedProductIds, tx);
         const productMap = new Map(products.map((p) => [p.id, p]));
 
@@ -93,7 +151,7 @@ export class OrderService {
           }
         }
 
-        // Step C: Acquire row-level locks deterministically in sorted order & check availability
+        // Step D: Acquire row-level locks deterministically in sorted order & check availability
         const lockedInventories = new Map<string, Inventory>();
 
         for (const item of mergedItems) {
@@ -117,7 +175,7 @@ export class OrderService {
           lockedInventories.set(item.productId, lockedInventory);
         }
 
-        // Step D: Calculate exact order totals using arbitrary-precision Decimals
+        // Step E: Calculate exact order totals using arbitrary-precision Decimals
         let totalAmount = new Prisma.Decimal(0);
         const preparedOrderItems = mergedItems.map((item) => {
           const product = productMap.get(item.productId)!;
@@ -134,10 +192,10 @@ export class OrderService {
           };
         });
 
-        // Step E: Generate unique order number
+        // Step F: Generate unique order number
         const orderNumber = this.generateOrderNumber();
 
-        // Step F: Create Order and OrderItems
+        // Step G: Create Order and OrderItems
         const createdOrder = await this.orderRepo.createOrder(tx, {
           customerId: input.customerId,
           orderNumber,
@@ -146,7 +204,7 @@ export class OrderService {
           items: preparedOrderItems,
         });
 
-        // Step G: Update reservedQuantity, create StockReservations, and create InventoryMovements
+        // Step H: Update reservedQuantity, create StockReservations, and create InventoryMovements
         const expiresAt = new Date(Date.now() + config.STOCK_RESERVATION_MINUTES * 60 * 1000);
 
         for (const item of preparedOrderItems) {
@@ -174,7 +232,7 @@ export class OrderService {
           });
         }
 
-        // Step H: Create OrderStatusHistory record
+        // Step I: Create OrderStatusHistory record
         await this.orderRepo.createStatusHistory(tx, {
           orderId: createdOrder.id,
           fromStatus: null,
@@ -182,19 +240,7 @@ export class OrderService {
           reason: 'Order created',
         });
 
-        logger.info(
-          {
-            orderId: createdOrder.id,
-            orderNumber: createdOrder.orderNumber,
-            customerId: createdOrder.customerId,
-            itemsCount: createdOrder.items.length,
-            totalAmount: createdOrder.totalAmount.toString(),
-          },
-          'Order created and stock reserved successfully'
-        );
-
-        // Format clean API response
-        return {
+        const responseData: OrderResponseView = {
           id: createdOrder.id,
           orderNumber: createdOrder.orderNumber,
           status: createdOrder.status,
@@ -206,15 +252,67 @@ export class OrderService {
             totalPrice: item.totalPrice.toFixed(2),
           })),
         };
+
+        // Step J: Persist response data into the claimed idempotency record
+        await this.idempotencyRepo.storeResponse(tx, input.customerId, key, 201, responseData);
+
+        logger.info(
+          {
+            orderId: createdOrder.id,
+            orderNumber: createdOrder.orderNumber,
+            customerId: createdOrder.customerId,
+            itemsCount: createdOrder.items.length,
+            totalAmount: createdOrder.totalAmount.toString(),
+            idempotencyKey: key,
+          },
+          'Order created and stock reserved successfully'
+        );
+
+        return {
+          statusCode: 201,
+          data: responseData,
+        };
       });
     } catch (error) {
+      // Handle race condition: Another concurrent transaction claimed this key
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        logger.info(
+          { customerId: input.customerId, key },
+          'Concurrent duplicate request detected via unique constraint (P2002). Polling for committed response...'
+        );
+
+        // Poll briefly for the winning transaction's committed response
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const committed = await this.idempotencyService.checkExisting<OrderResponseView>(
+            input.customerId,
+            key,
+            requestHash
+          );
+          if (committed) {
+            return {
+              statusCode: committed.statusCode,
+              data: committed.data,
+            };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        // If after polling, the record exists with a different hash
+        const existingKey = await this.idempotencyRepo.findByCustomerAndKey(input.customerId, key);
+        if (existingKey && existingKey.requestHash !== requestHash) {
+          throw new IdempotencyKeyReusedError(
+            'The idempotency key was already used with a different request'
+          );
+        }
+      }
+
       if (error instanceof AppError) {
         throw error;
       }
 
       logger.error(
-        { error, customerId: input.customerId },
-        'Unexpected error during order creation'
+        { error, customerId: input.customerId, idempotencyKey: key },
+        'Unexpected error during idempotent order creation'
       );
       throw error;
     }
