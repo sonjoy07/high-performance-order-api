@@ -46,6 +46,13 @@ export enum ErrorCode {
   USER_NOT_FOUND = 'USER_NOT_FOUND',
   ORDER_ACCESS_DENIED = 'ORDER_ACCESS_DENIED',
   ORDER_NOT_FOUND = 'ORDER_NOT_FOUND',
+
+  // Order Lifecycle & Cancellation Domain Errors
+  ORDER_CANCELLATION_NOT_ALLOWED = 'ORDER_CANCELLATION_NOT_ALLOWED',
+  ORDER_STATUS_TRANSITION_NOT_ALLOWED = 'ORDER_STATUS_TRANSITION_NOT_ALLOWED',
+  ORDER_ALREADY_CANCELLED = 'ORDER_ALREADY_CANCELLED',
+  STOCK_RESERVATION_NOT_FOUND = 'STOCK_RESERVATION_NOT_FOUND',
+  INVALID_ORDER_STATUS = 'INVALID_ORDER_STATUS',
 }
 
 export class AppError extends Error {
@@ -305,5 +312,35 @@ export class OrderAccessDeniedError extends AppError {
 export class OrderNotFoundError extends AppError {
   constructor(message = 'Order not found') {
     super(404, ErrorCode.ORDER_NOT_FOUND, message, true);
+  }
+}
+
+export class OrderCancellationNotAllowedError extends AppError {
+  constructor(message = 'Order cannot be cancelled in its current status') {
+    super(422, ErrorCode.ORDER_CANCELLATION_NOT_ALLOWED, message, true);
+  }
+}
+
+export class OrderStatusTransitionNotAllowedError extends AppError {
+  constructor(message = 'Order status transition is not allowed') {
+    super(422, ErrorCode.ORDER_STATUS_TRANSITION_NOT_ALLOWED, message, true);
+  }
+}
+
+export class OrderAlreadyCancelledError extends AppError {
+  constructor(message = 'Order has already been cancelled') {
+    super(409, ErrorCode.ORDER_ALREADY_CANCELLED, message, true);
+  }
+}
+
+export class StockReservationNotFoundError extends AppError {
+  constructor(message = 'Stock reservation not found') {
+    super(404, ErrorCode.STOCK_RESERVATION_NOT_FOUND, message, true);
+  }
+}
+
+export class InvalidOrderStatusError extends AppError {
+  constructor(message = 'Invalid order status') {
+    super(400, ErrorCode.INVALID_ORDER_STATUS, message, true);
   }
 }

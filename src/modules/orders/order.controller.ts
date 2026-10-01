@@ -1,9 +1,14 @@
 import { Request, Response, NextFunction } from 'express';
-import { UserRole } from '@prisma/client';
+import { OrderStatus, UserRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { OrderService, orderService as defaultOrderService } from './order.service';
 import { CreateOrderItemInput } from './order.types';
-import { createOrderSchema } from './order.validation';
+import {
+  cancelOrderSchema,
+  createOrderSchema,
+  orderIdParamSchema,
+  updateOrderStatusSchema,
+} from './order.validation';
 import { AuthenticationError, CustomerNotFoundError } from '../../common/errors/app.error';
 
 export interface CreateOrderRequestBody {
@@ -69,7 +74,7 @@ export class OrderController {
   };
 
   public getOrderById = async (
-    req: Request<{ id: string }>,
+    req: Request<{ id?: string; orderId?: string }>,
     res: Response,
     next: NextFunction
   ): Promise<void> => {
@@ -78,11 +83,99 @@ export class OrderController {
         throw new AuthenticationError('Authentication required');
       }
 
-      const order = await this.orderService.getOrderById(req.params.id, req.user);
+      const orderId = req.params.orderId ?? req.params.id!;
+      orderIdParamSchema.parse({ orderId });
+
+      const order = await this.orderService.getOrderById(orderId, req.user);
 
       res.status(200).json({
         success: true,
         data: order,
+      });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public cancelOrder = async (
+    req: Request<{ orderId?: string; id?: string }, unknown, { reason?: string }>,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    try {
+      if (!req.user) {
+        throw new AuthenticationError('Authentication required');
+      }
+
+      const orderId = req.params.orderId ?? req.params.id!;
+      orderIdParamSchema.parse({ orderId });
+      if (req.body && Object.keys(req.body).length > 0) {
+        cancelOrderSchema.parse(req.body);
+      }
+
+      const order = await this.orderService.cancelOrder(orderId, req.user, req.body?.reason);
+
+      res.status(200).json({
+        success: true,
+        data: order,
+      });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public updateOrderStatus = async (
+    req: Request<
+      { orderId?: string; id?: string },
+      unknown,
+      { status: OrderStatus; reason?: string }
+    >,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    try {
+      if (!req.user) {
+        throw new AuthenticationError('Authentication required');
+      }
+
+      const orderId = req.params.orderId ?? req.params.id!;
+      orderIdParamSchema.parse({ orderId });
+      updateOrderStatusSchema.parse(req.body);
+
+      const order = await this.orderService.updateOrderStatus(
+        orderId,
+        req.body.status,
+        req.user,
+        req.body.reason
+      );
+
+      res.status(200).json({
+        success: true,
+        data: order,
+      });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public getOrderHistory = async (
+    req: Request<{ orderId?: string; id?: string }>,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    try {
+      if (!req.user) {
+        throw new AuthenticationError('Authentication required');
+      }
+
+      const orderId = req.params.orderId ?? req.params.id!;
+      orderIdParamSchema.parse({ orderId });
+
+      const history = await this.orderService.getOrderHistory(orderId, req.user);
+
+      res.status(200).json({
+        success: true,
+        data: history,
       });
     } catch (error) {
       next(error);

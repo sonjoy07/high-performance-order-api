@@ -35,7 +35,8 @@ export interface CreateStatusHistoryData {
   orderId: string;
   fromStatus: OrderStatus | null;
   toStatus: OrderStatus;
-  reason: string;
+  changedBy?: string | null;
+  reason?: string | null;
 }
 
 export class OrderRepository {
@@ -49,6 +50,19 @@ export class OrderRepository {
     const client = tx ?? prisma;
     return client.customer.findUnique({
       where: { id: customerId },
+    });
+  }
+
+  /**
+   * Finds a customer by User ID.
+   */
+  public async findCustomerByUserId(
+    userId: string,
+    tx?: Prisma.TransactionClient
+  ): Promise<Customer | null> {
+    const client = tx ?? prisma;
+    return client.customer.findUnique({
+      where: { userId },
     });
   }
 
@@ -81,6 +95,27 @@ export class OrderRepository {
   }
 
   /**
+   * Acquires a row-level lock on an order (SELECT ... FOR UPDATE) and fetches its items.
+   */
+  public async lockOrderById(
+    tx: Prisma.TransactionClient,
+    orderId: string
+  ): Promise<(Order & { items: OrderItem[] }) | null> {
+    const rows = await tx.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "orders" WHERE id = ${orderId} FOR UPDATE
+    `;
+    if (!rows || rows.length === 0) {
+      return null;
+    }
+    return tx.order.findUnique({
+      where: { id: orderId },
+      include: {
+        items: true,
+      },
+    });
+  }
+
+  /**
    * Creates a stock reservation record associated with an order and product within an active transaction.
    */
   public async createStockReservation(
@@ -99,6 +134,55 @@ export class OrderRepository {
   }
 
   /**
+   * Finds all ACTIVE stock reservations for a given order within a transaction.
+   */
+  public async findActiveReservations(
+    tx: Prisma.TransactionClient,
+    orderId: string
+  ): Promise<StockReservation[]> {
+    return tx.stockReservation.findMany({
+      where: {
+        orderId,
+        status: ReservationStatus.ACTIVE,
+      },
+    });
+  }
+
+  /**
+   * Updates a stock reservation to RELEASED status and sets releasedAt timestamp.
+   */
+  public async releaseStockReservation(
+    tx: Prisma.TransactionClient,
+    reservationId: string,
+    releasedAt: Date = new Date()
+  ): Promise<StockReservation> {
+    return tx.stockReservation.update({
+      where: { id: reservationId },
+      data: {
+        status: ReservationStatus.RELEASED,
+        releasedAt,
+      },
+    });
+  }
+
+  /**
+   * Updates an order's status within an active transaction.
+   */
+  public async updateOrderStatus(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    status: OrderStatus
+  ): Promise<Order & { items: OrderItem[] }> {
+    return tx.order.update({
+      where: { id: orderId },
+      data: { status },
+      include: {
+        items: true,
+      },
+    });
+  }
+
+  /**
    * Creates an audit entry in the order status history within an active transaction.
    */
   public async createStatusHistory(
@@ -110,16 +194,31 @@ export class OrderRepository {
         orderId: data.orderId,
         fromStatus: data.fromStatus,
         toStatus: data.toStatus,
-        reason: data.reason,
+        changedBy: data.changedBy ?? null,
+        reason: data.reason ?? null,
       },
+    });
+  }
+
+  /**
+   * Retrieves full chronological status history for an order.
+   */
+  public async findStatusHistory(orderId: string): Promise<OrderStatusHistory[]> {
+    return prisma.orderStatusHistory.findMany({
+      where: { orderId },
+      orderBy: { changedAt: 'asc' },
     });
   }
 
   /**
    * Finds an order by its ID with nested order items.
    */
-  public async findById(orderId: string): Promise<(Order & { items: OrderItem[] }) | null> {
-    return prisma.order.findUnique({
+  public async findById(
+    orderId: string,
+    tx?: Prisma.TransactionClient
+  ): Promise<(Order & { items: OrderItem[] }) | null> {
+    const client = tx ?? prisma;
+    return client.order.findUnique({
       where: { id: orderId },
       include: {
         items: true,

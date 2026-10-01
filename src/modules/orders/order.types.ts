@@ -24,3 +24,24 @@ export interface OrderResponseView {
   totalAmount: string;
   items: OrderItemResponseView[];
 }
+
+export interface OrderStatusHistoryResponseView {
+  id: string;
+  orderId: string;
+  fromStatus: OrderStatus | null;
+  toStatus: OrderStatus;
+  changedBy: string | null;
+  reason: string | null;
+  createdAt: string;
+}
+
+export interface CancelOrderInput {
+  orderId: string;
+  reason?: string;
+}
+
+export interface UpdateOrderStatusInput {
+  orderId: string;
+  status: OrderStatus;
+  reason?: string;
+}

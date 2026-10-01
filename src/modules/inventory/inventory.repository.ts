@@ -156,6 +156,23 @@ export class InventoryRepository {
   }
 
   /**
+   * Atomically decrements the reservedQuantity on an inventory row within an active transaction.
+   */
+  public async decrementReservedQuantity(
+    tx: Prisma.TransactionClient,
+    id: string,
+    quantity: number
+  ): Promise<Inventory> {
+    return tx.inventory.update({
+      where: { id },
+      data: {
+        reservedQuantity: { decrement: quantity },
+        version: { increment: 1 },
+      },
+    });
+  }
+
+  /**
    * Records an inventory movement audit trail within an active transaction.
    */
   public async createMovement(

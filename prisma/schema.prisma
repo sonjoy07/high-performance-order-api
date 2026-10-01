@@ -198,6 +198,7 @@ model OrderStatusHistory {
   orderId    String
   fromStatus OrderStatus?
   toStatus   OrderStatus
+  changedBy  String?
   changedAt  DateTime     @default(now())
   reason     String?
 
