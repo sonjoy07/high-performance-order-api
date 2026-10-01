@@ -9,7 +9,7 @@ export enum ErrorCode {
   DATABASE_ERROR = 'DATABASE_ERROR',
   INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR',
 
-  // Domain specific error codes
+  // Category & Product Domain Errors
   CATEGORY_NOT_FOUND = 'CATEGORY_NOT_FOUND',
   PRODUCT_NOT_FOUND = 'PRODUCT_NOT_FOUND',
   DUPLICATE_CATEGORY = 'DUPLICATE_CATEGORY',
@@ -17,6 +17,12 @@ export enum ErrorCode {
   DUPLICATE_SKU = 'DUPLICATE_SKU',
   INVALID_CATEGORY = 'INVALID_CATEGORY',
   CATEGORY_HAS_PRODUCTS = 'CATEGORY_HAS_PRODUCTS',
+
+  // Inventory Domain Errors
+  INVENTORY_NOT_FOUND = 'INVENTORY_NOT_FOUND',
+  INSUFFICIENT_STOCK = 'INSUFFICIENT_STOCK',
+  INVENTORY_BELOW_RESERVED_STOCK = 'INVENTORY_BELOW_RESERVED_STOCK',
+  INVALID_STOCK_ADJUSTMENT = 'INVALID_STOCK_ADJUSTMENT',
 }
 
 export class AppError extends Error {
@@ -140,5 +146,33 @@ export class InvalidCategoryError extends AppError {
 export class CategoryHasProductsError extends AppError {
   constructor(message = 'Cannot delete category with associated products') {
     super(409, ErrorCode.CATEGORY_HAS_PRODUCTS, message, true);
+  }
+}
+
+// ==========================================
+// Inventory Domain Errors
+// ==========================================
+
+export class InventoryNotFoundError extends AppError {
+  constructor(message = 'Inventory record not found') {
+    super(404, ErrorCode.INVENTORY_NOT_FOUND, message, true);
+  }
+}
+
+export class InsufficientStockError extends AppError {
+  constructor(message = 'Insufficient stock') {
+    super(409, ErrorCode.INSUFFICIENT_STOCK, message, true);
+  }
+}
+
+export class InventoryBelowReservedStockError extends AppError {
+  constructor(message = 'Cannot adjust inventory below reserved stock quantity') {
+    super(409, ErrorCode.INVENTORY_BELOW_RESERVED_STOCK, message, true);
+  }
+}
+
+export class InvalidStockAdjustmentError extends AppError {
+  constructor(message = 'Invalid stock adjustment') {
+    super(400, ErrorCode.INVALID_STOCK_ADJUSTMENT, message, true);
   }
 }
