@@ -1,4 +1,11 @@
 import { z } from 'zod';
+import {
+  createSearchSchema,
+  createSortBySchema,
+  limitSchema,
+  pageSchema,
+  sortOrderSchema,
+} from '../../common/validation/query.validation';
 
 const slugRegex = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
@@ -51,16 +58,11 @@ export const updateCategorySchema = z
   });
 
 export const categoryQuerySchema = z.object({
-  page: z.coerce.number().int().min(1, 'Page must be at least 1').default(1),
-  limit: z.coerce
-    .number()
-    .int()
-    .min(1, 'Limit must be at least 1')
-    .max(100, 'Limit cannot exceed 100')
-    .default(20),
-  search: z.string().trim().optional(),
-  sortBy: z.enum(['name', 'createdAt', 'updatedAt']).default('createdAt'),
-  sortOrder: z.enum(['asc', 'desc']).default('desc'),
+  page: pageSchema,
+  limit: limitSchema,
+  search: createSearchSchema(),
+  sortBy: createSortBySchema(['name', 'createdAt', 'updatedAt'] as const, 'createdAt'),
+  sortOrder: sortOrderSchema,
 });
 
 export const categoryIdParamSchema = z.object({

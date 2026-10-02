@@ -3,6 +3,15 @@ import { z } from 'zod';
 
 dotenv.config();
 
+const isValidTimeZone = (value: string): boolean => {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().default(5000),
@@ -23,6 +32,23 @@ const envSchema = z.object({
   JWT_REFRESH_EXPIRES_IN: z.string().min(1).default('7d'),
   STOCK_RESERVATION_MINUTES: z.coerce.number().int().positive().default(30),
   IDEMPOTENCY_KEY_TTL_HOURS: z.coerce.number().int().positive().default(24),
+  /**
+   * IANA timezone used to resolve date-only query boundaries (`fromDate` / `toDate`).
+   * Date-only values such as `2026-01-31` mean the start/end of that calendar day in
+   * THIS timezone, so reports are deterministic regardless of the server's local time.
+   */
+  TIMEZONE: z
+    .string()
+    .refine(isValidTimeZone, { message: 'TIMEZONE must be a valid IANA timezone identifier' })
+    .default('UTC'),
+  /**
+   * Enables verbose Prisma SQL logging. Never defaults to on in production: SQL text is
+   * high-volume and can disclose query shapes. Production keeps error-level logging only.
+   */
+  PRISMA_LOG_QUERIES: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 });
 
 const parseEnv = () => {

@@ -1,4 +1,13 @@
 import { z } from 'zod';
+import {
+  createSearchSchema,
+  createSortBySchema,
+  limitSchema,
+  moneyInput,
+  pageSchema,
+  refineMoneyRange,
+  sortOrderSchema,
+} from '../../common/validation/query.validation';
 
 const slugRegex = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
@@ -71,17 +80,12 @@ export const updateProductSchema = z
 
 export const productQuerySchema = z
   .object({
-    page: z.coerce.number().int().min(1, 'Page must be at least 1').default(1),
-    limit: z.coerce
-      .number()
-      .int()
-      .min(1, 'Limit must be at least 1')
-      .max(100, 'Limit cannot exceed 100')
-      .default(20),
-    search: z.string().trim().optional(),
-    categoryId: z.string().trim().optional(),
-    minPrice: z.coerce.number().min(0, 'minPrice must be >= 0').optional(),
-    maxPrice: z.coerce.number().min(0, 'maxPrice must be >= 0').optional(),
+    page: pageSchema,
+    limit: limitSchema,
+    search: createSearchSchema(),
+    categoryId: z.string().trim().uuid('Invalid category ID format. Must be a valid UUID.').optional(),
+    minPrice: moneyInput,
+    maxPrice: moneyInput,
     isActive: z
       .preprocess((val) => {
         if (val === 'true' || val === true) return true;
@@ -89,21 +93,15 @@ export const productQuerySchema = z
         return val;
       }, z.boolean().optional())
       .optional(),
-    sortBy: z.enum(['name', 'price', 'createdAt', 'updatedAt']).default('createdAt'),
-    sortOrder: z.enum(['asc', 'desc']).default('desc'),
+    sortBy: createSortBySchema(
+      ['name', 'price', 'createdAt', 'updatedAt'] as const,
+      'createdAt'
+    ),
+    sortOrder: sortOrderSchema,
   })
-  .refine(
-    (data) => {
-      if (data.minPrice !== undefined && data.maxPrice !== undefined) {
-        return data.minPrice <= data.maxPrice;
-      }
-      return true;
-    },
-    {
-      message: 'minPrice cannot be greater than maxPrice',
-      path: ['minPrice'],
-    }
-  );
+  .superRefine((data, ctx) => {
+    refineMoneyRange({ minAmount: data.minPrice, maxAmount: data.maxPrice }, ctx);
+  });
 
 export const productIdParamSchema = z.object({
   id: z.string().trim().min(1, 'Product ID is required'),

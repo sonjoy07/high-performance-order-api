@@ -9,6 +9,7 @@ import { categoryRouter } from './modules/categories/category.route';
 import { productRouter } from './modules/products/product.route';
 import { inventoryRouter } from './modules/inventory/inventory.route';
 import { orderRouter } from './modules/orders/order.route';
+import { reportRouter } from './modules/reports/report.route';
 import { authRouter } from './modules/auth/auth.route';
 
 export const createApp = (): Express => {
@@ -30,6 +31,7 @@ export const createApp = (): Express => {
   app.use('/api/v1/products', productRouter);
   app.use('/api/v1/inventory', inventoryRouter);
   app.use('/api/v1/orders', orderRouter);
+  app.use('/api/v1/reports', reportRouter);
 
   // 404 Not Found Middleware
   app.use(notFoundHandler);

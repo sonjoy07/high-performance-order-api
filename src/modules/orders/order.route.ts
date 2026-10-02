@@ -5,12 +5,18 @@ import {
   cancelOrderSchema,
   createOrderSchema,
   orderIdParamSchema,
+  orderQuerySchema,
   updateOrderStatusSchema,
 } from './order.validation';
 import { orderController } from './order.controller';
 import { authenticate, requireRole } from '../auth/auth.middleware';
 
 const router = Router();
+
+// Order listing. Declared BEFORE `/:orderId` so "orders" is never parsed as an order ID.
+// Supports page/limit pagination, search, status, customerId, date range, amount range
+// and whitelisted sorting — all resolved inside PostgreSQL.
+router.get('/', authenticate, validateRequest({ query: orderQuerySchema }), orderController.listOrders);
 
 // Order creation requires authentication (CUSTOMER or ADMIN)
 router.post(

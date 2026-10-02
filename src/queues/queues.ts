@@ -3,7 +3,6 @@ import { JobsOptions } from 'bullmq';
 import { logger } from '../common/logger/logger';
 import { getOrderEventsQueue } from '../queues/queue.factory';
 import {
-  OrderEventPayload,
   OrderCreatedEvent,
   OrderCancelledEvent,
   OrderStatusChangedEvent,

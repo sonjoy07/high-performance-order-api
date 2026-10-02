@@ -1,13 +1,15 @@
 import { Prisma, Product } from '@prisma/client';
 import { prisma } from '../../config/prisma';
+import { buildStableOrderBy } from '../../common/utils/sorting';
+import { toDecimalFilter } from '../../common/validation/query.validation';
 
 export interface FindProductsParams {
   skip: number;
   take: number;
   search?: string;
   categoryId?: string;
-  minPrice?: number;
-  maxPrice?: number;
+  minPrice?: string;
+  maxPrice?: string;
   isActive?: boolean;
   sortBy: 'name' | 'price' | 'createdAt' | 'updatedAt';
   sortOrder: 'asc' | 'desc';
@@ -20,6 +22,33 @@ export type ProductWithCategory = Product & {
     slug: string;
   };
 };
+
+/**
+ * Explicit projection for product reads.
+ *
+ * Using `select` instead of `include` guarantees that any column added to the `Product`
+ * model later (internal flags, denormalized counters, audit columns) is *not* silently
+ * shipped to clients, and keeps the `EXPLAIN` output stable across schema evolution.
+ */
+export const PRODUCT_SELECT = {
+  id: true,
+  categoryId: true,
+  name: true,
+  slug: true,
+  description: true,
+  sku: true,
+  price: true,
+  isActive: true,
+  createdAt: true,
+  updatedAt: true,
+  category: {
+    select: {
+      id: true,
+      name: true,
+      slug: true,
+    },
+  },
+} satisfies Prisma.ProductSelect;
 
 export class ProductRepository {
   public async create(data: {
@@ -112,7 +141,14 @@ export class ProductRepository {
     });
   }
 
-  public async findMany(params: FindProductsParams): Promise<[ProductWithCategory[], number]> {
+  /**
+   * Builds the SQL-equivalent `WHERE` clause for the product catalogue.
+   *
+   * Search uses case-insensitive `ILIKE '%term%'`, which a plain B-tree cannot serve —
+   * the accompanying `pg_trgm` GIN indexes make it index-backed. The predicate is built
+   * once and shared by the page query and the `count` query so the two can never disagree.
+   */
+  public buildProductWhere(params: FindProductsParams): Prisma.ProductWhereInput {
     const andConditions: Prisma.ProductWhereInput[] = [];
 
     if (params.categoryId) {
@@ -123,14 +159,8 @@ export class ProductRepository {
       andConditions.push({ isActive: params.isActive });
     }
 
-    if (params.minPrice !== undefined || params.maxPrice !== undefined) {
-      const priceFilter: Prisma.DecimalFilter = {};
-      if (params.minPrice !== undefined) {
-        priceFilter.gte = new Prisma.Decimal(params.minPrice);
-      }
-      if (params.maxPrice !== undefined) {
-        priceFilter.lte = new Prisma.Decimal(params.maxPrice);
-      }
+    const priceFilter = toDecimalFilter({ min: params.minPrice, max: params.maxPrice });
+    if (priceFilter) {
       andConditions.push({ price: priceFilter });
     }
 
@@ -139,29 +169,34 @@ export class ProductRepository {
         OR: [
           { name: { contains: params.search, mode: 'insensitive' } },
           { sku: { contains: params.search, mode: 'insensitive' } },
+          { slug: { contains: params.search, mode: 'insensitive' } },
         ],
       });
     }
 
-    const where: Prisma.ProductWhereInput = andConditions.length > 0 ? { AND: andConditions } : {};
+    return andConditions.length > 0 ? { AND: andConditions } : {};
+  }
+
+  /**
+   * Paginated catalogue listing.
+   *
+   * `WHERE`, `ORDER BY`, `LIMIT` and `OFFSET` are all executed by PostgreSQL; the
+   * `id` tiebreaker keeps ordering total so paging cannot duplicate or drop rows.
+   * `findMany` and `count` share a transaction for a consistent snapshot.
+   */
+  public async findMany(params: FindProductsParams): Promise<[ProductWithCategory[], number]> {
+    const where = this.buildProductWhere(params);
 
     const [products, total] = await prisma.$transaction([
       prisma.product.findMany({
         where,
         skip: params.skip,
         take: params.take,
-        orderBy: {
-          [params.sortBy]: params.sortOrder,
-        },
-        include: {
-          category: {
-            select: {
-              id: true,
-              name: true,
-              slug: true,
-            },
-          },
-        },
+        orderBy: buildStableOrderBy<Prisma.ProductOrderByWithRelationInput>(
+          params.sortBy,
+          params.sortOrder
+        ),
+        select: PRODUCT_SELECT,
       }),
       prisma.product.count({ where }),
     ]);

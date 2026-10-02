@@ -1,0 +1,16 @@
+{
+  // Type-check only the operational tooling (perf seed + measurement scripts).
+  //
+  // These files are executed by tsx, not compiled into dist/, so the production
+  // tsconfig deliberately excludes them (its `rootDir` is ./src). Without this
+  // separate project they would ship unverified — a broken EXPLAIN script is worse
+  // than no script, because its output looks authoritative.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["prisma/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist", "tests", "prisma/migrations"]
+}

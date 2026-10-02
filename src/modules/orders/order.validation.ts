@@ -1,6 +1,17 @@
 import { OrderStatus } from '@prisma/client';
 import { z } from 'zod';
 import { CreateOrderItemInput } from './order.types';
+import {
+  createSearchSchema,
+  createSortBySchema,
+  createStatusSchema,
+  dateRangeFields,
+  moneyRangeFields,
+  paginationFields,
+  refineDateRange,
+  refineMoneyRange,
+  sortOrderSchema,
+} from '../../common/validation/query.validation';
 
 /**
  * State Transition Matrix for Order Lifecycle.
@@ -76,6 +87,60 @@ export const createOrderSchema = z.object({
 });
 
 export type CreateOrderSchemaInput = z.infer<typeof createOrderSchema>;
+
+// =========================================================================
+// Order listing / search / filtering / sorting query contract
+// =========================================================================
+
+/**
+ * Whitelist of client-sortable order columns.
+ *
+ * `req.query.sortBy` is NEVER forwarded to Prisma directly. Only values present in this
+ * tuple survive validation, so an attacker cannot reach arbitrary SQL fragments such as
+ * `sortBy=id) OR 1=1 --`.
+ *
+ * Note: `id` is intentionally absent as a *primary* sort option (it is always appended as
+ * the stable tiebreaker), and `customerId` is not user-sortable because it is a UUID and
+ * sorting by it has no meaningful business value.
+ */
+export const ORDER_SORT_FIELDS = [
+  'createdAt',
+  'updatedAt',
+  'totalAmount',
+  'orderNumber',
+  'status',
+] as const;
+
+export type OrderSortField = (typeof ORDER_SORT_FIELDS)[number];
+
+export const orderQuerySchema = z
+  .object({
+    ...paginationFields,
+
+    /** Free-text search over `orderNumber` (+ customer email for ADMIN). */
+    search: createSearchSchema(),
+
+    /** Single status filter. Validated against the Prisma `OrderStatus` enum. */
+    status: createStatusSchema(OrderStatus).optional(),
+
+    /** ADMIN-only customer filter. Ignored (and force-overridden) for CUSTOMER requests. */
+    customerId: z
+      .string()
+      .uuid('Invalid customer ID format. Must be a valid UUID.')
+      .optional(),
+
+    ...dateRangeFields,
+    ...moneyRangeFields,
+
+    sortBy: createSortBySchema(ORDER_SORT_FIELDS, 'createdAt'),
+    sortOrder: sortOrderSchema,
+  })
+  .superRefine((data, ctx) => {
+    refineDateRange(data, ctx);
+    refineMoneyRange(data, ctx);
+  });
+
+export type OrderQueryInput = z.infer<typeof orderQuerySchema>;
 
 /**
  * Normalizes order items:

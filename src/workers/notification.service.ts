@@ -1,6 +1,6 @@
-import { logger } from '../../common/logger/logger';
-import { OrderEventPayload } from '../../jobs/order.jobs';
-import { ORDER_EVENT_TYPES } from '../../queues/queue.constants';
+import { logger } from '../common/logger/logger';
+import { OrderEventPayload } from '../jobs/order.jobs';
+import { ORDER_EVENT_TYPES } from '../queues/queue.constants';
 
 /**
  * NotificationProvider interface.

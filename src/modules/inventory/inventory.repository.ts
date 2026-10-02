@@ -18,6 +18,25 @@ export interface StockAdjustmentData {
   reason?: string | null;
 }
 
+export interface ReservedQuantityDelta {
+  productId: string;
+  /** Signed change applied to `reservedQuantity` (negative to release). */
+  delta: number;
+}
+
+export interface MovementInput {
+  productId: string;
+  type: InventoryMovementType;
+  quantity: number;
+  referenceType: string;
+  referenceId?: string | null;
+}
+
+/** Columns returned by the locked inventory projection. */
+const LOCKED_INVENTORY_COLUMNS = Prisma.sql`
+  id, "productId", quantity, "reservedQuantity", version, "createdAt", "updatedAt"
+`;
+
 export class InventoryRepository {
   public async findByProductId(productId: string): Promise<Inventory | null> {
     return prisma.inventory.findUnique({
@@ -122,78 +141,102 @@ export class InventoryRepository {
   }
 
   /**
-   * Locks a single inventory row using PostgreSQL row-level locking (SELECT ... FOR UPDATE)
-   * within an active transaction.
+   * Locks many inventory rows in ONE statement (`SELECT ... FOR UPDATE`).
+   *
+   * N+1 FIX
+   * ------
+   * The previous implementation called `lockByProductId` once per order line, so an order
+   * with N distinct products issued N round-trips that each returned a single row. This
+   * method issues a single `WHERE "productId" = ANY(...)` statement regardless of N.
+   *
+   * DEADLOCK SAFETY
+   * ---------------
+   * Two concurrent orders containing overlapping products must not deadlock. `ORDER BY
+   * "productId"` guarantees a single global lock order, and PostgreSQL places the
+   * `LockRows` node above the `Sort`, so rows are locked in that sorted order rather than
+   * in physical scan order. Callers must therefore pass `productIds` already de-duplicated;
+   * sorting is applied here so no caller can get it wrong.
+   *
+   * A missing row is reported by the caller comparing `rows.length` against the requested
+   * id count, because `FOR UPDATE` returns no row (and never null-padding) for absent keys.
    */
-  public async lockByProductId(
+  public async lockByProductIds(
     tx: Prisma.TransactionClient,
-    productId: string
-  ): Promise<Inventory | null> {
+    productIds: string[]
+  ): Promise<Map<string, Inventory>> {
+    const uniqueIds = Array.from(new Set(productIds)).sort((a, b) => a.localeCompare(b));
+
+    if (uniqueIds.length === 0) {
+      return new Map();
+    }
+
     const rows = await tx.$queryRaw<Inventory[]>`
-      SELECT id, "productId", quantity, "reservedQuantity", version, "createdAt", "updatedAt"
+      SELECT ${LOCKED_INVENTORY_COLUMNS}
       FROM "inventories"
-      WHERE "productId" = ${productId}
+      WHERE "productId" = ANY(${uniqueIds}::text[])
+      ORDER BY "productId"
       FOR UPDATE
     `;
-    return rows[0] ?? null;
+
+    return new Map(rows.map((row) => [row.productId, row]));
   }
 
   /**
-   * Atomically increments the reservedQuantity on an inventory row within an active transaction.
+   * Applies signed `reservedQuantity` deltas to many inventory rows in ONE statement.
+   *
+   * N+1 FIX
+   * ------
+   * Replaces the per-item `incrementReservedQuantity` / `decrementReservedQuantity` calls.
+   * The set-based `UPDATE ... FROM (VALUES ...)` keeps the arithmetic atomic per row (the
+   * read-modify-write happens inside PostgreSQL, never in Node.js), so it is still safe
+   * against lost updates even without relying on the earlier lock.
+   *
+   * The affected-row count is returned so the caller can detect a missing inventory row
+   * instead of silently skipping it.
    */
-  public async incrementReservedQuantity(
+  public async applyReservedQuantityDeltas(
     tx: Prisma.TransactionClient,
-    id: string,
-    quantity: number
-  ): Promise<Inventory> {
-    return tx.inventory.update({
-      where: { id },
-      data: {
-        reservedQuantity: { increment: quantity },
-        version: { increment: 1 },
-      },
-    });
-  }
-
-  /**
-   * Atomically decrements the reservedQuantity on an inventory row within an active transaction.
-   */
-  public async decrementReservedQuantity(
-    tx: Prisma.TransactionClient,
-    id: string,
-    quantity: number
-  ): Promise<Inventory> {
-    return tx.inventory.update({
-      where: { id },
-      data: {
-        reservedQuantity: { decrement: quantity },
-        version: { increment: 1 },
-      },
-    });
-  }
-
-  /**
-   * Records an inventory movement audit trail within an active transaction.
-   */
-  public async createMovement(
-    tx: Prisma.TransactionClient,
-    data: {
-      productId: string;
-      type: InventoryMovementType;
-      quantity: number;
-      referenceType: string;
-      referenceId?: string | null;
+    deltas: ReservedQuantityDelta[]
+  ): Promise<number> {
+    if (deltas.length === 0) {
+      return 0;
     }
-  ): Promise<InventoryMovement> {
-    return tx.inventoryMovement.create({
-      data: {
-        productId: data.productId,
-        type: data.type,
-        quantity: data.quantity,
-        referenceType: data.referenceType,
-        referenceId: data.referenceId ?? null,
-      },
+
+    const values = deltas.map((entry) => Prisma.sql`(${entry.productId}, ${entry.delta}::integer)`);
+
+    return tx.$executeRaw`
+      UPDATE "inventories" AS i
+      SET "reservedQuantity" = i."reservedQuantity" + v.delta,
+          "version"           = i."version" + 1,
+          "updatedAt"         = NOW()
+      FROM (VALUES ${Prisma.join(values)}) AS v(product_id, delta)
+      WHERE i."productId" = v.product_id
+    `;
+  }
+
+  /**
+   * Records many inventory movements in ONE statement (`createMany`).
+   * Replaces the per-item `createMovement` call in order create/cancel flows.
+   */
+  public async createMovements(
+    tx: Prisma.TransactionClient,
+    movements: MovementInput[]
+  ): Promise<number> {
+    if (movements.length === 0) {
+      return 0;
+    }
+
+    const result = await tx.inventoryMovement.createMany({
+      data: movements.map((movement) => ({
+        productId: movement.productId,
+        type: movement.type,
+        quantity: movement.quantity,
+        referenceType: movement.referenceType,
+        referenceId: movement.referenceId ?? null,
+      })),
     });
+
+    return result.count;
   }
 }
 

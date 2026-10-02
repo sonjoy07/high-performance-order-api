@@ -1,6 +1,5 @@
 import crypto from 'crypto';
 import {
-  Inventory,
   InventoryMovementType,
   Order,
   OrderItem,
@@ -12,6 +11,9 @@ import {
 import { prisma } from '../../config/prisma';
 import { config } from '../../config/env';
 import { logger } from '../../common/logger/logger';
+import { formatMoney } from '../../common/utils/money';
+import { buildPaginationArgs, buildPaginationMeta } from '../../common/utils/pagination';
+import { PaginatedResult } from '../../common/types/pagination';
 import {
   AppError,
   AuthorizationError,
@@ -45,17 +47,20 @@ import {
   idempotencyService as defaultIdempotencyService,
 } from '../idempotency/idempotency.service';
 import { OrderRepository, orderRepository as defaultOrderRepo } from './order.repository';
-import { CreateOrderInput, OrderResponseView, OrderStatusHistoryResponseView } from './order.types';
+import {
+  CreateOrderInput,
+  OrderDetailResponseView,
+  OrderListItemView,
+  OrderResponseView,
+  OrderStatusHistoryResponseView,
+} from './order.types';
 import {
   canTransitionOrderStatus,
   isCancellableStatus,
   mergeAndSortOrderItems,
+  OrderQueryInput,
 } from './order.validation';
-import {
-  enqueueOrderCreated,
-  enqueueOrderCancelled,
-  enqueueOrderStatusChanged,
-} from '../../queues/queues';
+import { enqueueOrderCreated } from '../../queues/queues';
 
 
 export interface CreateOrderResult {
@@ -140,7 +145,7 @@ export class OrderService {
     const idempotencyExpiresAt = this.idempotencyService.getExpirationDate();
 
     try {
-      return await prisma.$transaction(async (tx) => {
+      const result = await prisma.$transaction(async (tx) => {
         // Step A: Validate customer exists
         const customer = await this.orderRepo.findCustomerById(input.customerId, tx);
         if (!customer) {
@@ -171,19 +176,23 @@ export class OrderService {
           }
         }
 
-        // Step D: Acquire row-level locks deterministically in sorted order & check availability
-        const lockedInventories = new Map<string, Inventory>();
+        // Step D: Acquire row-level locks in a single statement & check availability
+        //
+        // N+1 FIX: one `SELECT ... WHERE "productId" = ANY(...) ORDER BY ... FOR UPDATE`
+        // replaces one lock query per order line. The ORDER BY gives every concurrent
+        // transaction the same lock order, so overlapping orders cannot deadlock.
+        const lockedInventories = await this.inventoryRepo.lockByProductIds(tx, sortedProductIds);
+
+        if (lockedInventories.size !== sortedProductIds.length) {
+          const missingId = sortedProductIds.find((id) => !lockedInventories.has(id));
+          throw new InventoryNotFoundError(
+            `Inventory record not found for product "${missingId}"`
+          );
+        }
 
         for (const item of mergedItems) {
           const product = productMap.get(item.productId)!;
-
-          // PostgreSQL row-level lock
-          const lockedInventory = await this.inventoryRepo.lockByProductId(tx, item.productId);
-          if (!lockedInventory) {
-            throw new InventoryNotFoundError(
-              `Inventory record not found for product "${product.name}"`
-            );
-          }
+          const lockedInventory = lockedInventories.get(item.productId)!;
 
           // Calculate available stock: available = quantity - reservedQuantity
           const availableQuantity = lockedInventory.quantity - lockedInventory.reservedQuantity;
@@ -191,8 +200,6 @@ export class OrderService {
           if (item.quantity > availableQuantity) {
             throw new InsufficientStockError(`Insufficient stock for product ${product.name}`);
           }
-
-          lockedInventories.set(item.productId, lockedInventory);
         }
 
         // Step E: Calculate exact order totals using arbitrary-precision Decimals
@@ -224,33 +231,42 @@ export class OrderService {
           items: preparedOrderItems,
         });
 
-        // Step H: Update reservedQuantity, create StockReservations, and create InventoryMovements
+        // Step H: Reserve stock — three set-based statements regardless of line count
+        //
+        // N+1 FIX: the previous implementation ran three queries per order line
+        // (UPDATE inventory, INSERT reservation, INSERT movement) => 3N round-trips.
+        // These are now one UPDATE, one createMany and one createMany => 3 queries total.
         const expiresAt = new Date(Date.now() + config.STOCK_RESERVATION_MINUTES * 60 * 1000);
 
-        for (const item of preparedOrderItems) {
-          const lockedInventory = lockedInventories.get(item.productId)!;
+        const updatedCount = await this.inventoryRepo.applyReservedQuantityDeltas(
+          tx,
+          preparedOrderItems.map((item) => ({ productId: item.productId, delta: item.quantity }))
+        );
+        if (updatedCount !== preparedOrderItems.length) {
+          throw new InventoryNotFoundError('One or more inventory rows disappeared mid-transaction');
+        }
 
-          // 1. Increment reservedQuantity in Inventory (quantity remains unchanged)
-          await this.inventoryRepo.incrementReservedQuantity(tx, lockedInventory.id, item.quantity);
-
-          // 2. Create StockReservation
-          await this.orderRepo.createStockReservation(tx, {
+        await this.orderRepo.createStockReservations(
+          tx,
+          preparedOrderItems.map((item) => ({
             orderId: createdOrder.id,
             productId: item.productId,
             quantity: item.quantity,
             status: ReservationStatus.ACTIVE,
             expiresAt,
-          });
+          }))
+        );
 
-          // 3. Create InventoryMovement audit record
-          await this.inventoryRepo.createMovement(tx, {
+        await this.inventoryRepo.createMovements(
+          tx,
+          preparedOrderItems.map((item) => ({
             productId: item.productId,
             type: InventoryMovementType.RESERVATION,
             quantity: item.quantity,
             referenceType: 'ORDER',
             referenceId: createdOrder.id,
-          });
-        }
+          }))
+        );
 
         // Step I: Create OrderStatusHistory record
         await this.orderRepo.createStatusHistory(tx, {
@@ -370,28 +386,136 @@ export class OrderService {
   }
 
   /**
-   * Retrieves an order by ID with ownership verification.
-   * If customer, order.customerId must match customer.id (enforces IDOR protection).
-   * Admins can access any order.
+   * Retrieves an order detail with a single, fully-projected query.
+   *
+   * N+1 avoidance
+   * -------------
+   * The classic failure mode is `order → customer → items → (per item) product`.
+   * Instead the repository issues ONE projected query whose relation graph is
+   * `order + customer(+user) + items(+product) + statusHistory`. Prisma resolves each
+   * relation with a batched statement scoped to the page, so the number of round-trips is
+   * constant regardless of how many items the order has.
+   *
+   * IDOR protection
+   * ---------------
+   * `customer.userId` is part of the projection, so ownership is verified against data we
+   * already loaded — no second lookup, and no way to accidentally skip the check.
    */
   public async getOrderById(
     orderId: string,
     user: { id: string; role: UserRole }
-  ): Promise<Order & { items: OrderItem[] }> {
-    const order = await this.orderRepo.findById(orderId);
+  ): Promise<OrderDetailResponseView> {
+    const order = await this.orderRepo.findDetailById(orderId);
     if (!order) {
       throw new OrderNotFoundError(`Order with ID "${orderId}" not found`);
     }
 
-    if (user.role !== UserRole.ADMIN) {
-      const customer = await this.orderRepo.findCustomerByUserId(user.id);
-
-      if (!customer || order.customerId !== customer.id) {
-        throw new OrderAccessDeniedError('You do not have permission to access this order');
-      }
+    if (user.role !== UserRole.ADMIN && order.customer.userId !== user.id) {
+      throw new OrderAccessDeniedError('You do not have permission to access this order');
     }
 
-    return order;
+    return {
+      id: order.id,
+      orderNumber: order.orderNumber,
+      status: order.status,
+      totalAmount: formatMoney(order.totalAmount),
+      customerId: order.customerId,
+      customer: {
+        id: order.customer.id,
+        firstName: order.customer.firstName,
+        lastName: order.customer.lastName,
+        phone: order.customer.phone,
+        email: order.customer.user.email,
+      },
+      items: order.items.map((item) => ({
+        id: item.id,
+        productId: item.productId,
+        productName: item.product.name,
+        productSku: item.product.sku,
+        productSlug: item.product.slug,
+        quantity: item.quantity,
+        unitPrice: formatMoney(item.unitPrice),
+        totalPrice: formatMoney(item.totalPrice),
+      })),
+      statusHistory: order.statusHistory.map((entry) => ({
+        id: entry.id,
+        fromStatus: entry.fromStatus,
+        toStatus: entry.toStatus,
+        changedBy: entry.changedBy,
+        reason: entry.reason,
+        createdAt: entry.changedAt.toISOString(),
+      })),
+      createdAt: order.createdAt.toISOString(),
+      updatedAt: order.updatedAt.toISOString(),
+    };
+  }
+
+  /**
+   * Paginated, filtered, searchable order listing.
+   *
+   * Authorization is enforced *before* any query is built:
+   *  - CUSTOMER: `customerId` is resolved from the access token and forced into the WHERE
+   *    clause, ignoring any `customerId` the client may have sent. A CUSTOMER therefore
+   *    cannot read another customer's orders by manipulating query parameters.
+   *  - ADMIN: may filter by `customerId` and additionally search customer email.
+   *
+   * Filtering, pagination, sorting and the total count all happen inside PostgreSQL.
+   */
+  public async listOrders(
+    query: OrderQueryInput,
+    user: { id: string; role: UserRole }
+  ): Promise<PaginatedResult<OrderListItemView>> {
+    const isAdmin = user.role === UserRole.ADMIN;
+
+    // Server-side ownership scope — never taken from the request for CUSTOMER.
+    let scopedCustomerId = query.customerId;
+    if (!isAdmin) {
+      const customer = await this.orderRepo.findCustomerByUserId(user.id);
+      if (!customer) {
+        throw new CustomerNotFoundError(
+          'Authenticated user does not have an associated customer profile'
+        );
+      }
+      scopedCustomerId = customer.id;
+    }
+
+    const { skip, take } = buildPaginationArgs(query.page, query.limit);
+
+    const [rows, total] = await this.orderRepo.findManyForList({
+      skip,
+      take,
+      customerId: scopedCustomerId,
+      status: query.status,
+      search: query.search,
+      searchCustomerFields: isAdmin,
+      fromDate: query.fromDate,
+      toDate: query.toDate,
+      minAmount: query.minAmount,
+      maxAmount: query.maxAmount,
+      sortBy: query.sortBy,
+      sortOrder: query.sortOrder,
+    });
+
+    const items: OrderListItemView[] = rows.map((row) => ({
+      id: row.id,
+      orderNumber: row.orderNumber,
+      status: row.status,
+      totalAmount: formatMoney(row.totalAmount),
+      customerId: row.customerId,
+      itemCount: row.itemCount,
+      customer: {
+        id: row.customer.id,
+        firstName: row.customer.firstName,
+        lastName: row.customer.lastName,
+      },
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    }));
+
+    return {
+      data: items,
+      pagination: buildPaginationMeta(query.page, query.limit, total),
+    };
   }
 
   /**
@@ -460,37 +584,61 @@ export class OrderService {
 
       const sortedProductIds = Array.from(releaseMap.keys()).sort((a, b) => a.localeCompare(b));
 
-      // Step 6: Acquire row locks on inventories in sorted order and release reserved stock
+      // Step 6: Lock all affected inventory rows in one statement and release reserved stock
+      //
+      // N+1 FIX: one `SELECT ... FOR UPDATE` + one set-based `UPDATE` + one `createMany`
+      // replace 3 queries per distinct product.
+      const lockedInventories = await this.inventoryRepo.lockByProductIds(tx, sortedProductIds);
+
       for (const productId of sortedProductIds) {
-        const releaseQty = releaseMap.get(productId)!;
-        const lockedInventory = await this.inventoryRepo.lockByProductId(tx, productId);
-        if (!lockedInventory) {
+        if (!lockedInventories.has(productId)) {
           throw new InventoryNotFoundError(`Inventory record not found for product "${productId}"`);
         }
+
+        const releaseQty = releaseMap.get(productId)!;
+        const lockedInventory = lockedInventories.get(productId)!;
 
         if (lockedInventory.reservedQuantity < releaseQty) {
           throw new BusinessLogicError(
             `Inconsistent inventory state: reservedQuantity (${lockedInventory.reservedQuantity}) is less than release quantity (${releaseQty})`
           );
         }
+      }
 
-        // Decrement reservedQuantity (physical quantity is NOT touched)
-        await this.inventoryRepo.decrementReservedQuantity(tx, lockedInventory.id, releaseQty);
+      // Physical quantity is NOT touched — only the reservation is released.
+      const releasedCount = await this.inventoryRepo.applyReservedQuantityDeltas(
+        tx,
+        sortedProductIds.map((productId) => ({
+          productId,
+          delta: -releaseMap.get(productId)!,
+        }))
+      );
+      if (releasedCount !== sortedProductIds.length) {
+        throw new InventoryNotFoundError('One or more inventory rows disappeared mid-transaction');
+      }
 
-        // Record RELEASE movement audit trail
-        await this.inventoryRepo.createMovement(tx, {
+      await this.inventoryRepo.createMovements(
+        tx,
+        sortedProductIds.map((productId) => ({
           productId,
           type: InventoryMovementType.RELEASE,
-          quantity: releaseQty,
+          quantity: releaseMap.get(productId)!,
           referenceType: 'ORDER',
           referenceId: order.id,
-        });
-      }
+        }))
+      );
 
       // Step 7: Update stock reservations to RELEASED
       const now = new Date();
-      for (const res of activeReservations) {
-        await this.orderRepo.releaseStockReservation(tx, res.id, now);
+      const releasedReservations = await this.orderRepo.releaseStockReservations(
+        tx,
+        activeReservations.map((reservation) => reservation.id),
+        now
+      );
+      if (releasedReservations !== activeReservations.length) {
+        throw new StockReservationNotFoundError(
+          `One or more active stock reservations for order "${order.id}" were already released`
+        );
       }
 
       // Step 8: Update order status to CANCELLED
@@ -587,12 +735,15 @@ export class OrderService {
 
   /**
    * Retrieves full chronological status history for an order with customer ownership protection.
+   *
+   * Only the ownership columns are read first (`select: { customerId: true }`) — loading
+   * the whole order detail here would be wasted I/O, and loading nothing would be an IDOR hole.
    */
   public async getOrderHistory(
     orderId: string,
     user: { id: string; role: UserRole }
   ): Promise<OrderStatusHistoryResponseView[]> {
-    const order = await this.orderRepo.findById(orderId);
+    const order = await this.orderRepo.findOwnershipById(orderId);
     if (!order) {
       throw new OrderNotFoundError(`Order with ID "${orderId}" not found`);
     }

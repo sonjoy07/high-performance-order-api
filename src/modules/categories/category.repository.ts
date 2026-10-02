@@ -1,5 +1,16 @@
 import { Category, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
+import { buildStableOrderBy } from '../../common/utils/sorting';
+
+/** Explicit projection so no internal column can leak into catalogue responses. */
+export const CATEGORY_SELECT = {
+  id: true,
+  name: true,
+  slug: true,
+  description: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.CategorySelect;
 
 export interface FindCategoriesParams {
   skip: number;
@@ -42,32 +53,43 @@ export class CategoryRepository {
     });
   }
 
-  public async findMany(params: FindCategoriesParams): Promise<[Category[], number]> {
-    const where: Prisma.CategoryWhereInput = {};
+  /**
+   * Builds the SQL-equivalent `WHERE` clause for category listings.
+   * Search maps to case-insensitive `ILIKE` and is served by a `pg_trgm` GIN index;
+   * filtering always happens in PostgreSQL, never in Node.js.
+   */
+  public buildCategoryWhere(params: FindCategoriesParams): Prisma.CategoryWhereInput {
+    const andConditions: Prisma.CategoryWhereInput[] = [];
 
     if (params.search) {
-      where.OR = [
-        { name: { contains: params.search, mode: 'insensitive' } },
-        { slug: { contains: params.search, mode: 'insensitive' } },
-      ];
+      andConditions.push({
+        OR: [
+          { name: { contains: params.search, mode: 'insensitive' } },
+          { slug: { contains: params.search, mode: 'insensitive' } },
+        ],
+      });
     }
+
+    return andConditions.length > 0 ? { AND: andConditions } : {};
+  }
+
+  /**
+   * Paginated category listing with DB-side filtering, sorting and paging.
+   * Ordering is made total by appending the `id` tiebreaker.
+   */
+  public async findMany(params: FindCategoriesParams): Promise<[Category[], number]> {
+    const where = this.buildCategoryWhere(params);
 
     const [categories, total] = await prisma.$transaction([
       prisma.category.findMany({
         where,
         skip: params.skip,
         take: params.take,
-        orderBy: {
-          [params.sortBy]: params.sortOrder,
-        },
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-          description: true,
-          createdAt: true,
-          updatedAt: true,
-        },
+        orderBy: buildStableOrderBy<Prisma.CategoryOrderByWithRelationInput>(
+          params.sortBy,
+          params.sortOrder
+        ),
+        select: CATEGORY_SELECT,
       }),
       prisma.category.count({ where }),
     ]);

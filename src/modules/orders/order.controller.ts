@@ -7,6 +7,7 @@ import {
   cancelOrderSchema,
   createOrderSchema,
   orderIdParamSchema,
+  orderQuerySchema,
   updateOrderStatusSchema,
 } from './order.validation';
 import { AuthenticationError, CustomerNotFoundError } from '../../common/errors/app.error';
@@ -67,6 +68,32 @@ export class OrderController {
       res.status(result.statusCode).json({
         success: true,
         data: result.data,
+      });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public listOrders = async (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    try {
+      if (!req.user) {
+        throw new AuthenticationError('Authentication required');
+      }
+
+      // Re-validate defensively: the route already validated, but the controller is also
+      // unit-testable in isolation and must never trust unvalidated query input.
+      const query = orderQuerySchema.parse(req.query);
+
+      const result = await this.orderService.listOrders(query, req.user);
+
+      res.status(200).json({
+        success: true,
+        data: result.data,
+        pagination: result.pagination,
       });
     } catch (error) {
       next(error);

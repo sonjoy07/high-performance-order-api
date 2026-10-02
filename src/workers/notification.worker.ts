@@ -5,7 +5,7 @@ import { config } from '../config/env';
 import { logger } from '../common/logger/logger';
 import { getQueueConnection } from '../queues/queue.factory';
 import { OrderEventPayload } from '../jobs/order.jobs';
-import { QUEUE_NAMES, WORKER_CONCURRENCY } from '../queues/queue.constants';
+import { QUEUE_NAMES } from '../queues/queue.constants';
 import { notificationService } from './notification.service';
 
 /**

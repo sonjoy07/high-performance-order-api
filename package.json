@@ -9,17 +9,22 @@
     "worker:prod": "node dist/worker.js",
     "build": "tsc",
     "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"prisma/**/*.ts\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"prisma/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"prisma/**/*.ts\" \"scripts/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"prisma/**/*.ts\" \"scripts/**/*.ts\"",
     "test": "jest --testPathPatterns=\"^(?!.*integration)\" --forceExit",
     "test:integration": "jest --testPathPatterns=\"integration\" --forceExit --runInBand",
     "test:all": "jest --forceExit",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
-    "db:seed": "tsx prisma/seed.ts"
+    "db:seed": "tsx prisma/seed.ts",
+    "db:seed:perf": "tsx prisma/seed.perf.ts",
+    "db:seed:reset": "tsx prisma/seed.perf.ts --reset",
+    "perf:explain": "tsx scripts/explain-analyze.ts",
+    "perf:queries": "tsx scripts/measure-queries.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
