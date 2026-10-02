@@ -923,207 +923,161 @@ npm run build
 
 ---
 
-## Phase 9 â€” Redis Caching & Cache Invalidation
+## Phase 13 — Docker & Production Runtime
 
-### Overview
+### Quick Start (Docker Compose)
 
-Phase 9 introduces Redis caching via the **cache-aside pattern** to reduce redundant PostgreSQL queries on read-heavy, stable data.
+```bash
+# Build images and start all services
+docker compose up --build
 
-**Cached resources:** Products and Categories only.
-**Not cached:** Inventory, Orders, Auth tokens.
+# Start in detached mode
+docker compose up -d --build
+
+# Stop containers (data volumes preserved)
+docker compose down
+
+# Stop AND wipe all data (volumes deleted)
+docker compose down -v
+```
+
+### Services
+
+| Service    | Description                          | Port (local) |
+|------------|--------------------------------------|--------------|
+| `postgres`  | PostgreSQL 16                        | 5432         |
+| `redis`     | Redis 7 (cache + BullMQ)            | 6379         |
+| `api`       | Express HTTP API (compiled JS)       | 5000         |
+| `worker`    | BullMQ notification worker (no HTTP) | —            |
 
 ### Architecture
 
 ```text
-Request
-  â†“
-Service
-  â”œâ”€ withCache(key, fetcher)
-  â”‚    â”œâ”€ Redis HIT  â†’ return parsed JSON
-  â”‚    â””â”€ Redis MISS â†’ acquire lock â†’ fetch DB â†’ store in Redis â†’ return
-  â””â”€ On Redis failure â†’ fallback to DB transparently
+Client
+  ?
+API (port 5000)
+  +-- PostgreSQL  ? synchronous, transactional
+  +-- Redis       ? cache, rate limiting, BullMQ
+  +-- Queue (BullMQ)
+            ?
+          Worker  ? asynchronous notifications
 ```
 
-### Infrastructure
+#### Synchronous (critical path — must not fail silently)
+- Order creation & idempotency
+- Inventory reservation & stock locking
+- Order cancellation & stock release
+- Status transitions
 
-| File | Purpose |
-|---|---|
-| `src/infrastructure/redis/redis.client.ts` | Singleton ioredis client, lazy connect, graceful failure |
-| `src/infrastructure/redis/redis.service.ts` | `get`, `set`, `del`, `delPattern` (SCAN-based), `acquireLock`, `releaseLock` |
-| `src/infrastructure/redis/redis.constants.ts` | Cache namespace prefixes, lock config |
-| `src/common/cache/cache-key.builder.ts` | Deterministic sorted-param key builders |
-| `src/common/cache/cache.helper.ts` | `withCache()` â€” cache-aside with stampede protection |
+#### Asynchronous (non-critical — worker processes in background)
+- Order event notifications (ORDER_CREATED, ORDER_CANCELLED, etc.)
+- Other background side effects
 
-### Cache Key Strategy
-
-```text
-cache:products:list:{sorted-query-params}     # Product list with all filter/sort/page params
-cache:products:detail:{productId}             # Single product detail
-cache:categories:list:{sorted-query-params}   # Category list
-cache:categories:detail:{categoryId}          # Single category detail
-cache:lock:{main-key}                         # Distributed lock key (5s TTL, NX)
-```
-
-### Stampede Protection
-
-When a cache key is missing:
-
-1. Attempt to acquire a distributed lock (`SET key token NX EX 5`).
-2. If acquired â†’ double-check cache (another process may have populated it) â†’ fetch DB â†’ populate cache â†’ release lock.
-3. If not acquired â†’ fall through directly to DB (no waiting, avoids lock-wait pile-up).
-4. Lock is always released in `finally` and auto-expires after 5 seconds.
-
-### Cache Invalidation Strategy
-
-Cache is invalidated **after** the DB write succeeds (never before):
-
-| Operation | Invalidated Keys |
-|---|---|
-| `createProduct` | All product list keys (`cache:products:list:*`) |
-| `updateProduct` | Product detail key + all product list keys |
-| `deleteProduct` (hard or soft) | Product detail key + all product list keys |
-| `createCategory` | All category list keys (`cache:categories:list:*`) |
-| `updateCategory` | Category detail key + all category list keys |
-| `deleteCategory` | Category detail key + all category list keys |
-
-Pattern deletion uses Redis `SCAN` (cursor-based) instead of `KEYS` to avoid blocking the server.
-
-### Graceful Redis Failure
-
-All Redis operations are wrapped in try/catch. If Redis is unavailable:
-- `get` returns `null` (triggers cache miss â†’ DB fallback)
-- `set`, `del`, `delPattern`, lock operations are silent no-ops
-- No error is surfaced to the HTTP client
-
-### Configuration
-
-```env
-REDIS_URL=redis://localhost:6379
-CACHE_TTL_SECONDS=300
-```
-
-### Starting Redis (Development)
-
-Use the included Docker Compose:
+### Health & Readiness
 
 ```bash
-# Start Redis
-docker compose up -d redis
+# Liveness check (lightweight — no dependency probes)
+curl http://localhost:5000/health
 
-# Verify
+# Readiness check (probes PostgreSQL + Redis)
+curl http://localhost:5000/health/ready
+```
+
+### Inspecting Logs
+
+```bash
+docker compose logs -f api
+docker compose logs -f worker
 docker compose ps
 ```
 
-### Testing
-
-Cache tests use `ioredis-mock` â€” no live Redis required for CI:
+### Database Operations
 
 ```bash
-npx jest --testPathPatterns="cache"
+# Run pending migrations (idempotent, production-safe)
+docker compose exec api npx prisma migrate deploy
+
+# Seed with sample data (development only)
+docker compose exec api npm run db:seed
+
+# Open Prisma Studio (local dev)
+docker compose exec api npx prisma studio
 ```
 
-**Test coverage (25 tests):**
+### Environment Variables
 
-| Suite | Tests |
+Copy `.env.example` to `.env` and adjust for your environment.
+
+> **? Production**: Replace all `change-me` values with strong secrets before deploying.
+> Use `openssl rand -hex 32` to generate secure secrets.
+
+Key variables:
+
+| Variable | Purpose |
 |---|---|
-| `cache-key.builder` | Deterministic keys, empty param filtering |
-| `redisService` | get/set/del/delPattern, lock acquire/release, null-client fallback |
-| `withCache` | Cache miss â†’ DB, cache hit, corruption recovery, Redis-null fallback, stampede (2nd wave) |
-| `ProductService â€” caching` | Detail caching, update invalidation |
-| `CategoryService â€” caching` | Detail caching, delete invalidation, create list invalidation |
+| `DATABASE_URL` | PostgreSQL connection string — use service name `postgres` inside Docker |
+| `REDIS_URL` | Redis connection string — use service name `redis` inside Docker |
+| `JWT_ACCESS_SECRET` | Access token signing key (min 32 chars) |
+| `JWT_REFRESH_SECRET` | Refresh token signing key (min 32 chars) |
+| `WORKER_CONCURRENCY` | Number of parallel BullMQ jobs (default: 5) |
+| `CACHE_TTL_SECONDS` | Redis cache TTL in seconds (default: 300) |
 
-## Phase 11: Query Optimization, Indexing & N+1 Elimination
+### Docker Networking
 
-### Database-side Querying (Non-negotiable)
-- All list endpoints push filtering, pagination (LIMIT/OFFSET), sorting, and totals into PostgreSQL. The API never loads entire tables into Node.js to paginate or filter them.
-- Order lists use explicit field projections, stable sort construction (uildStableOrderBy), and MAX_LIMIT=100 enforced by the shared pagination utilities. The secondary sort id DESC is always appended when the primary sort is not id to guarantee deterministic paging under ties.
-- Decimal filters are exact (
-umeric(12,2)) and date-only filters are timezone-aware: 	oDate is normalized to the end of the calendar day using a validated TIMEZONE (configured via env.TIMEZONE), with impossible calendar dates rejected by Zod.
-- Admin-only customer-email search resolves matching customerIds via a single bounded lookup (indCustomerIdsMatchingEmail, capped at 500 ids and logged on truncation) instead of a Prisma relation join chain. This keeps the predicate indexable (customerId IN (...)) and avoids the 50k-row join the relation form emitted.
-- Product/category listing uses explicit selects, substring search with ILIKE against indexed text columns, and decimal-safe range predicates.
+Services communicate using Compose service names:
 
-### Index Review & Migration
-- Orders: (customerId, createdAt, id) for customer-scoped lists, (status, createdAt, id) for status filters, (createdAt, id) for global lists, and trigram GIN on orderNumber (pg_trgm extension). These match the exact predicates/order-bys issued by the application.
-- Inventory movements: (productId, createdAt) replaces separate single-column indexes and directly supports the WHERE productId = ? AND createdAt <= ? ORDER BY createdAt DESC LIMIT ? access pattern.
-- Order status history: (orderId, changedAt).
-- Reservations: (orderId, status) retained alongside existing product/expiry indexes.
-- Products: (categoryId, createdAt, id), retained createdAt, trigram GIN on 
-ame and sku. The isActive column was deliberately left unindexed (low selectivity).
-- Users: trigram GIN on email.
-- Migration: prisma/migrations/20261002000000_phase11_query_indexes/migration.sql creates pg_trgm, idempotently adds/removes indexes, and runs ANALYZE at the end. prisma migrate diff confirms no drift between schema and migration state.
-- Database inspection is possible without psql using the raw pg client (scripts/explain-analyze.ts).
+```
+postgres:5432   ? database
+redis:6379      ? cache + queue
+```
 
-### N+1 Elimination (measured)
-- Order list item counts: removed Prisma's relation _count (which materialised an aggregate over the entire order_items table per request). Introduced a page-scoped count: fetch the page's order ids (	ake <= MAX_LIMIT), then orderItem.groupBy by orderId for only those ids (countItemsForOrders + ttachItemCounts). This drops the derived table from every page and keeps the GROUP BY bounded to at most 100 groups. Measured: the legacy _count form ran ~101 ms on the 50k-order dataset; the page-scoped form runs ~1.3 ms for the default list (see scripts/explain-analyze.ts).
-- Inventory writes: removed per-line round-trips during order creation/cancellation. Acquire all required inventory rows in one sorted SELECT ... FOR UPDATE (one query regardless of line count), compute and apply all eservedQuantity deltas in one set-based UPDATE ... FROM (VALUES ...), and insert reservations/movements in batched createMany calls. Reservation release is a single updateMany by id IN (...). Existing tests (141/141) continue to pass after this refactor.
-- Email search: the relation-based filter produced a LEFT JOIN chain that prevented index use; the id-probe form executes the email match via trigram index and then probes orders.customerId IN (...). Measured: legacy relation filter ~171 ms; id-probe form ~9.1 ms on the same dataset.
+**Never use `localhost` for inter-container communication** — `localhost` resolves to the container itself.
 
-### Reporting
-- All reports are ADMIN-only and execute SQL-side aggregations only. GET /api/v1/reports/orders/status-summary returns every OrderStatus key (default 0) to guarantee a stable shape for clients. 
-- GET /api/v1/reports/orders groups all statuses so cancelledOrders and cancelledRevenue are always populated; realized revenue and average order value are computed from non-cancelled rows only (business rule). 
-- GET /api/v1/reports/revenue: with includeCancelled=false (default) 	otalRevenue/orderCount/verageOrderValue reflect realized revenue; includeCancelled=true flips them to gross value. Cancelled figures are always broken out separately. 
-- GET /api/v1/reports/products uses a single raw SQL join/group with ORDER BY totalRevenue DESC, totalQuantitySold DESC, productId ASC and returns exact decimal strings for both revenue and quantity.
+### Database Migration Strategy
 
-### Query Logging
-- Development-only: PRISMA_LOG_QUERIES=true enables query events. The logger no longer attempts to reconstruct query durations from the event (the query event is post-execution) and never logs bound parameter values — only placeholder SQL and the parameter count. A lightweight repeated-statement detector warns on suspicious recurrence (N+1 heuristic). Production is forced to ['error'].
+- **Development:** `npx prisma migrate dev` (creates migration files, may prompt for reset)
+- **Production/Docker:** `npx prisma migrate deploy` (applies pending migrations, never resets)
 
-### Observed Performance (EXPLAIN ANALYZE, 50k orders)
-Representative numbers from scripts/explain-analyze.ts against the perf dataset (cold/typical single request):
-- orders:customer-list-default (page + total + scoped item counts): ~1.3–2.1 ms (4 statements). No sequential scan on the page path; uses composite indexes.
-- orders:list-legacy-relation-count (documented before-fix): ~101 ms (single statement) due to aggregating order_items in full before LIMIT.
-- orders:search-customer-email-substring (id probe): ~9.1 ms (3 statements). 
-- orders:search-customer-email-legacy-relation-filter (documented before-fix): ~171 ms (2 statements) due to join chain preventing index use.
-- eports:status-summary-group-by (full scan): ~15.9 ms (1 statement). The unfiltered GROUP BY over all statuses performs a sequential scan by design (and is reported in findings as intentional given the table size/predicate).
-- eports:product-sales-join-group: ~79 ms (1 statement) for a bounded top-N over joined aggregates.
+The API container runs `prisma migrate deploy` automatically on startup via the `command` in `docker-compose.yml`.
 
-See docs/phase11-query-plans.md (or the raw output of 
-pm run perf:explain) for full plan trees, buffers, row estimates and findings.
+### Redis Persistence
 
-### Tooling
-- scripts/explain-analyze.ts — runs 21 scenarios with EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON), validates estimates and sorts/IO, and prints a markdown-style summary. Statements mirror Prisma's actual emitted SQL (captured via query events). Includes both current implementations and legacy forms to make the measured improvement explicit.
-- scripts/measure-queries.ts — counts repository-level statements per request path (via Prisma query events) and reports wall-clock averages/min/max across iterations. The tool drives the real repository/service code, not hand-written SQL, so it reflects the exact query count the application issues.
-- 
-pm run typecheck — runs 	sc --noEmit and 	sc -p tsconfig.scripts.json --noEmit.
-- 
-pm run db:seed:perf / 
-pm run db:seed:reset — generates a large, deterministic performance dataset (additive by default; --reset clears orders/inventory history/products/categories/customers/users first).
-- 
-pm run perf:explain — executes the EXPLAIN scenarios against the current database.
-- 
-pm run perf:queries — executes the statement-count/latency measurements.
+Redis is configured with RDB snapshot persistence (`--save 60 1`): a snapshot is taken every 60 seconds if at least 1 key changed. This ensures BullMQ jobs survive Redis restarts.
 
-### Tests
-- Added 	ests/phase11-query.test.ts (35 tests): order list behaviour (search, filters, date boundaries, decimal ranges, stable sorting, pagination envelope, ownership, MAX_LIMIT and whitelist enforcement), N+1 regression guards (page-scoped item counts called once regardless of page size, skipped on empty pages, email search uses bounded id lookup only when requested, customer search never traverses customer fields), product/category behaviour, and reporting semantics (role guards, status-summary shape, realized/gross revenue with cancelled breakdown, order summary breakdown, top-products bounds). Tests derive report expectations from the live database so they remain correct against the 50k-row dataset as well as a fresh seeded dataset.
-- All existing unit and integration tests (176 total) still pass after the refactors.
+### Dockerfile
 
+Multi-stage build:
 
-## Phase 12: API Security Hardening, Rate Limiting & API Documentation
+```
+deps  ? install all dependencies (dev + prod, for tsc + prisma generate)
+build ? npx prisma generate + npm run build (TypeScript ? JavaScript)
+production ? npm ci --omit=dev, copy dist/, run as non-root nodejs user
+```
 
-### Security Architecture
-- **Authentication & Authorization:** JWT-based authentication with access/refresh token rotation. Admin-only endpoints enforced via role guards; customer endpoints enforce ownership (IDOR prevention).
-- **Password Security:** Passwords hashed using bcrypt (10 rounds). Passwords never returned in responses or logged.
-- **Token Security:** Access and refresh tokens use separate secrets and lifetimes. Refresh tokens stored as SHA-256 digests in database. Refresh tokens cannot be used as access tokens (type validation).
-- **Timing Attack Resistance:** Dummy hash comparison performed for non-existent emails during login to prevent user enumeration.
-- **Input Validation:** Comprehensive Zod validation on all request bodies, params, and query strings with detailed error messages.
-- **SQL Injection Prevention:** Parameterized queries via Prisma ORM; no raw string concatenation in queries.
+The final image:
+- Uses `node:22-alpine` (LTS, minimal footprint)
+- Runs as non-root `nodejs` user (UID 1001)
+- Uses `dumb-init` as PID 1 for proper signal forwarding
+- Ships only production `node_modules`
+- Does NOT contain `.env`, test code, or dev tooling
 
-### Rate Limiting
-- **Redis-backed with fallback:** Rate limiting uses Redis via rate-limit-redis. If Redis is unavailable, the system falls back to in-memory store (fail-open with warning logged once) to preserve API availability.
-- **Configurable tiers:** Global (60000/100), Auth (60000/10 on auth endpoints), Orders (60000/20 on POST /api/v1/orders).
-- **Identity-based keys:** Prefer authenticated identity (customerId > user.id), fallback to client IP. trust proxy enabled.
-- **Rate limit exceeded:** Returns HTTP 429 with ErrorCode.RATE_LIMIT_EXCEEDED and standard rate-limit headers.
-- **Test behavior:** Rate limiting can be skipped in tests via SKIP_RATE_LIMIT=true.
+### Graceful Shutdown
 
-### Security Middleware
-- **Helmet:** Security headers enabled.
-- **CORS:** Configured via CORS_ORIGINS (comma-separated). * rejected by default; credentials supported.
-- **Body size limits:** JSON/urlencoded payloads limited by BODY_LIMIT (default 1mb).
-- **Request logging:** Pino request logging with sensitive data redaction.
-- **Error hardening:** Production 500 errors return generic message 'An unexpected error occurred.' with full details logged server-side.
+Both the API and worker handle `SIGTERM` / `SIGINT`:
 
-### API Documentation
-- **Swagger/OpenAPI:** Interactive API documentation available at GET /api/docs.
-- **Authentication:** Bearer JWT authentication documented via components.securitySchemes.bearerAuth.
-- **Coverage:** Auth, Categories, Products, Inventory, Orders, and Reports endpoints documented with schemas, parameters, and examples (fake data only).
-- **Usage:** Access /api/docs in browser; for authenticated endpoints, click Authorize and provide a valid JWT access token (Bearer <token>).
+**API shutdown order:**
+1. Stop accepting new HTTP requests
+2. Wait for active requests to complete
+3. Close BullMQ queue connections
+4. Disconnect Redis
+5. Disconnect PostgreSQL (Prisma)
+6. Exit 0
+
+**Worker shutdown order:**
+1. Stop accepting new BullMQ jobs
+2. Wait for in-flight jobs to complete
+3. Close worker connection
+4. Close queue connections
+5. Disconnect PostgreSQL
+6. Exit 0
 

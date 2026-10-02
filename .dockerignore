@@ -1,0 +1,51 @@
+# Dependencies & build artifacts
+node_modules
+dist
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Environment & secrets — NEVER bake into the image
+.env
+.env.*
+!.env.example
+
+# Test artifacts
+coverage
+tests
+jest.config.js
+
+# Linting / formatting
+eslint.config.js
+prettier.config.js
+.eslintignore
+.prettierignore
+
+# TypeScript source maps and declaration files (not needed at runtime)
+*.map
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Docker itself
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Development scripts / tools
+scripts
+
+# Editor settings
+.vscode
+.idea
+
+# Prisma migration engine binaries regenerated at build time
+prisma/migrations

@@ -74,8 +74,34 @@ const parseEnv = () => {
     );
     process.exit(1);
   }
-  return result.data;
+
+  const cfg = result.data;
+
+  // ── Production safety guards ─────────────────────────────────────────────
+  // Refuse to start in production with known-insecure default secrets.
+  if (cfg.NODE_ENV === 'production') {
+    const insecureDefaults = [
+      ['JWT_SECRET', cfg.JWT_SECRET, 'change-me'],
+      ['JWT_ACCESS_SECRET', cfg.JWT_ACCESS_SECRET, 'access-secret-key-super-secure-min-32-chars'],
+      ['JWT_REFRESH_SECRET', cfg.JWT_REFRESH_SECRET, 'refresh-secret-key-super-secure-min-32-chars'],
+    ] as const;
+
+    const violations = insecureDefaults
+      .filter(([, value, bad]) => value === bad || value.includes('change-me'))
+      .map(([name]) => name);
+
+    if (violations.length > 0) {
+      console.error(
+        `❌ Production startup refused: insecure default values detected for: ${violations.join(', ')}. ` +
+          'Set strong secrets before deploying.'
+      );
+      process.exit(1);
+    }
+  }
+
+  return cfg;
 };
 
 export const config = parseEnv();
 export type Config = z.infer<typeof envSchema>;
+
