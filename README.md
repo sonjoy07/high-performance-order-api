@@ -1096,3 +1096,34 @@ pm run perf:queries — executes the statement-count/latency measurements.
 - Added 	ests/phase11-query.test.ts (35 tests): order list behaviour (search, filters, date boundaries, decimal ranges, stable sorting, pagination envelope, ownership, MAX_LIMIT and whitelist enforcement), N+1 regression guards (page-scoped item counts called once regardless of page size, skipped on empty pages, email search uses bounded id lookup only when requested, customer search never traverses customer fields), product/category behaviour, and reporting semantics (role guards, status-summary shape, realized/gross revenue with cancelled breakdown, order summary breakdown, top-products bounds). Tests derive report expectations from the live database so they remain correct against the 50k-row dataset as well as a fresh seeded dataset.
 - All existing unit and integration tests (176 total) still pass after the refactors.
 
+
+## Phase 12: API Security Hardening, Rate Limiting & API Documentation
+
+### Security Architecture
+- **Authentication & Authorization:** JWT-based authentication with access/refresh token rotation. Admin-only endpoints enforced via role guards; customer endpoints enforce ownership (IDOR prevention).
+- **Password Security:** Passwords hashed using bcrypt (10 rounds). Passwords never returned in responses or logged.
+- **Token Security:** Access and refresh tokens use separate secrets and lifetimes. Refresh tokens stored as SHA-256 digests in database. Refresh tokens cannot be used as access tokens (type validation).
+- **Timing Attack Resistance:** Dummy hash comparison performed for non-existent emails during login to prevent user enumeration.
+- **Input Validation:** Comprehensive Zod validation on all request bodies, params, and query strings with detailed error messages.
+- **SQL Injection Prevention:** Parameterized queries via Prisma ORM; no raw string concatenation in queries.
+
+### Rate Limiting
+- **Redis-backed with fallback:** Rate limiting uses Redis via rate-limit-redis. If Redis is unavailable, the system falls back to in-memory store (fail-open with warning logged once) to preserve API availability.
+- **Configurable tiers:** Global (60000/100), Auth (60000/10 on auth endpoints), Orders (60000/20 on POST /api/v1/orders).
+- **Identity-based keys:** Prefer authenticated identity (customerId > user.id), fallback to client IP. trust proxy enabled.
+- **Rate limit exceeded:** Returns HTTP 429 with ErrorCode.RATE_LIMIT_EXCEEDED and standard rate-limit headers.
+- **Test behavior:** Rate limiting can be skipped in tests via SKIP_RATE_LIMIT=true.
+
+### Security Middleware
+- **Helmet:** Security headers enabled.
+- **CORS:** Configured via CORS_ORIGINS (comma-separated). * rejected by default; credentials supported.
+- **Body size limits:** JSON/urlencoded payloads limited by BODY_LIMIT (default 1mb).
+- **Request logging:** Pino request logging with sensitive data redaction.
+- **Error hardening:** Production 500 errors return generic message 'An unexpected error occurred.' with full details logged server-side.
+
+### API Documentation
+- **Swagger/OpenAPI:** Interactive API documentation available at GET /api/docs.
+- **Authentication:** Bearer JWT authentication documented via components.securitySchemes.bearerAuth.
+- **Coverage:** Auth, Categories, Products, Inventory, Orders, and Reports endpoints documented with schemas, parameters, and examples (fake data only).
+- **Usage:** Access /api/docs in browser; for authenticated endpoints, click Authorize and provide a valid JWT access token (Bearer <token>).
+

@@ -9,6 +9,7 @@ import {
   updateOrderStatusSchema,
 } from './order.validation';
 import { orderController } from './order.controller';
+import { orderCreationRateLimiter } from '../../common/middleware/rate-limit.middleware';
 import { authenticate, requireRole } from '../auth/auth.middleware';
 
 const router = Router();
@@ -21,8 +22,9 @@ router.get('/', authenticate, validateRequest({ query: orderQuerySchema }), orde
 // Order creation requires authentication (CUSTOMER or ADMIN)
 router.post(
   '/',
-  authenticate,
+  orderCreationRateLimiter,
   validateRequest({ body: createOrderSchema }),
+  // idempotency handled by service,
   orderController.createOrder
 );
 

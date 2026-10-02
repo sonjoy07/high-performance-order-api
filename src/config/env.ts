@@ -49,6 +49,20 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+
+  // Rate limiting
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(100),
+  AUTH_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  AUTH_RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(10),
+  ORDER_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  ORDER_RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(20),
+
+  // CORS
+  CORS_ORIGINS: z.string().default('http://localhost:3000'),
+
+  // Request size limits
+  BODY_LIMIT: z.string().default('1mb'),
 });
 
 const parseEnv = () => {
