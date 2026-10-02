@@ -269,4 +269,21 @@ model RefreshToken {
   @@index([expiresAt])
   @@map("refresh_tokens")
 }
+// ==========================================
+// Queue & Worker Models
+// ==========================================
 
+/// Tracks which BullMQ jobs have been successfully processed by a worker.
+/// Used to implement worker-side idempotency: if a job with the same eventId
+/// and eventType is received again (e.g. due to at-least-once delivery),
+/// the worker can detect the duplicate and skip re-processing.
+model ProcessedJob {
+  id          String   @id @default(uuid())
+  eventId     String
+  eventType   String
+  processedAt DateTime @default(now())
+
+  @@unique([eventId, eventType])
+  @@index([processedAt])
+  @@map("processed_jobs")
+}

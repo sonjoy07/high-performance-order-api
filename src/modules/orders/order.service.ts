@@ -51,6 +51,12 @@ import {
   isCancellableStatus,
   mergeAndSortOrderItems,
 } from './order.validation';
+import {
+  enqueueOrderCreated,
+  enqueueOrderCancelled,
+  enqueueOrderStatusChanged,
+} from '../../queues/queues';
+
 
 export interface CreateOrderResult {
   statusCode: number;
@@ -287,6 +293,19 @@ export class OrderService {
           data: responseData,
         };
       });
+
+      // ── Post-commit: enqueue ORDER_CREATED background event ──────────────
+      // This runs AFTER the transaction has committed. If enqueueing fails, the
+      // order is still successfully created — the failure is logged but not surfaced
+      // to the client. See README for the Transactional Outbox Pattern limitation.
+      void enqueueOrderCreated({
+        orderId: result.data.id,
+        customerId: input.customerId,
+        orderNumber: result.data.orderNumber,
+        totalAmount: result.data.totalAmount,
+      });
+
+      return result;
     } catch (error) {
       // Handle race condition: Another concurrent transaction claimed this key
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {

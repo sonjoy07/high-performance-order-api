@@ -14,6 +14,8 @@ const envSchema = z.object({
   REDIS_PORT: z.coerce.number().default(6379),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+  QUEUE_PREFIX: z.string().default('high-performance-order-api'),
+  WORKER_CONCURRENCY: z.coerce.number().int().positive().default(5),
   JWT_SECRET: z.string().min(1).default('change-me'),
   JWT_ACCESS_SECRET: z.string().min(1).default('access-secret-key-super-secure-min-32-chars'),
   JWT_ACCESS_EXPIRES_IN: z.string().min(1).default('15m'),
