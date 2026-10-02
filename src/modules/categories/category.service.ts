@@ -14,6 +14,14 @@ import {
   CategoryHasProductsError,
 } from '../../common/errors/app.error';
 import { PaginatedResult } from '../../common/types/pagination';
+import { withCache } from '../../common/cache/cache.helper';
+import { redisService } from '../../infrastructure/redis/redis.service';
+import { CACHE_NS } from '../../infrastructure/redis/redis.constants';
+import {
+  buildCategoryDetailKey,
+  buildCategoryListKey,
+} from '../../common/cache/cache-key.builder';
+
 
 export class CategoryService {
   constructor(private readonly repo: CategoryRepository = defaultCategoryRepo) {}
@@ -29,11 +37,17 @@ export class CategoryService {
       throw new DuplicateCategoryError(`Category with slug "${input.slug}" already exists`);
     }
 
-    return this.repo.create(input);
+    const created = await this.repo.create(input);
+
+    // Invalidate list cache — new category changes list results
+    await redisService.delPattern(`${CACHE_NS.CATEGORIES_LIST}:*`);
+
+    return created;
   }
 
   public async getCategoryById(id: string): Promise<Category> {
-    const category = await this.repo.findById(id);
+    const cacheKey = buildCategoryDetailKey(id);
+    const category = await withCache(cacheKey, () => this.repo.findById(id));
     if (!category) {
       throw new CategoryNotFoundError(`Category with ID "${id}" not found`);
     }
@@ -43,26 +57,29 @@ export class CategoryService {
   public async listCategories(query: CategoryQueryInput): Promise<PaginatedResult<Category>> {
     const { page, limit, search, sortBy, sortOrder } = query;
     const skip = (page - 1) * limit;
+    const cacheKey = buildCategoryListKey({ page, limit, search, sortBy, sortOrder });
 
-    const [categories, total] = await this.repo.findMany({
-      skip,
-      take: limit,
-      search,
-      sortBy,
-      sortOrder,
+    return withCache(cacheKey, async () => {
+      const [categories, total] = await this.repo.findMany({
+        skip,
+        take: limit,
+        search,
+        sortBy,
+        sortOrder,
+      });
+
+      const totalPages = Math.ceil(total / limit) || (total === 0 ? 0 : 1);
+
+      return {
+        data: categories,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages,
+        },
+      };
     });
-
-    const totalPages = Math.ceil(total / limit) || (total === 0 ? 0 : 1);
-
-    return {
-      data: categories,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages,
-      },
-    };
   }
 
   public async updateCategory(id: string, input: UpdateCategoryInput): Promise<Category> {
@@ -85,7 +102,15 @@ export class CategoryService {
       }
     }
 
-    return this.repo.update(id, input);
+    const updated = await this.repo.update(id, input);
+
+    // Invalidate detail and list keys
+    await Promise.all([
+      redisService.del(buildCategoryDetailKey(id)),
+      redisService.delPattern(`${CACHE_NS.CATEGORIES_LIST}:*`),
+    ]);
+
+    return updated;
   }
 
   public async deleteCategory(id: string): Promise<Category> {
@@ -101,7 +126,15 @@ export class CategoryService {
       );
     }
 
-    return this.repo.delete(id);
+    const deleted = await this.repo.delete(id);
+
+    // Invalidate detail and list keys
+    await Promise.all([
+      redisService.del(buildCategoryDetailKey(id)),
+      redisService.delPattern(`${CACHE_NS.CATEGORIES_LIST}:*`),
+    ]);
+
+    return deleted;
   }
 }
 

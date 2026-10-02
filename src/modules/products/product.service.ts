@@ -16,6 +16,11 @@ import {
   DuplicateProductError,
 } from '../../common/errors/app.error';
 import { PaginatedResult } from '../../common/types/pagination';
+import { withCache } from '../../common/cache/cache.helper';
+import { redisService } from '../../infrastructure/redis/redis.service';
+import { CACHE_NS } from '../../infrastructure/redis/redis.constants';
+import { buildProductDetailKey, buildProductListKey } from '../../common/cache/cache-key.builder';
+
 
 export interface DeleteProductResult {
   id: string;
@@ -47,7 +52,7 @@ export class ProductService {
       throw new DuplicateProductError(`Product with slug "${input.slug}" already exists`);
     }
 
-    return this.repo.create({
+    const created = await this.repo.create({
       categoryId: input.categoryId,
       name: input.name,
       slug: input.slug,
@@ -56,10 +61,16 @@ export class ProductService {
       price: input.price,
       isActive: input.isActive,
     });
+
+    // Invalidate product list cache — new product changes list results
+    await redisService.delPattern(`${CACHE_NS.PRODUCTS_LIST}:*`);
+
+    return created;
   }
 
   public async getProductById(id: string): Promise<ProductWithCategory> {
-    const product = await this.repo.findById(id);
+    const cacheKey = buildProductDetailKey(id);
+    const product = await withCache(cacheKey, () => this.repo.findById(id));
     if (!product) {
       throw new ProductNotFoundError(`Product with ID "${id}" not found`);
     }
@@ -73,30 +84,33 @@ export class ProductService {
       query;
 
     const skip = (page - 1) * limit;
+    const cacheKey = buildProductListKey({ page, limit, search, categoryId, minPrice, maxPrice, isActive, sortBy, sortOrder });
 
-    const [products, total] = await this.repo.findMany({
-      skip,
-      take: limit,
-      search,
-      categoryId,
-      minPrice,
-      maxPrice,
-      isActive,
-      sortBy,
-      sortOrder,
+    return withCache(cacheKey, async () => {
+      const [products, total] = await this.repo.findMany({
+        skip,
+        take: limit,
+        search,
+        categoryId,
+        minPrice,
+        maxPrice,
+        isActive,
+        sortBy,
+        sortOrder,
+      });
+
+      const totalPages = Math.ceil(total / limit) || (total === 0 ? 0 : 1);
+
+      return {
+        data: products,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages,
+        },
+      };
     });
-
-    const totalPages = Math.ceil(total / limit) || (total === 0 ? 0 : 1);
-
-    return {
-      data: products,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages,
-      },
-    };
   }
 
   public async updateProduct(id: string, input: UpdateProductInput): Promise<ProductWithCategory> {
@@ -139,7 +153,15 @@ export class ProductService {
       updateData.category = { connect: { id: input.categoryId } };
     }
 
-    return this.repo.update(id, updateData);
+    const updated = await this.repo.update(id, updateData);
+
+    // Invalidate detail key and all list keys
+    await Promise.all([
+      redisService.del(buildProductDetailKey(id)),
+      redisService.delPattern(`${CACHE_NS.PRODUCTS_LIST}:*`),
+    ]);
+
+    return updated;
   }
 
   public async deleteProduct(id: string): Promise<DeleteProductResult> {
@@ -154,6 +176,13 @@ export class ProductService {
     if (orderItemCount > 0 || reservationCount > 0) {
       // Historical references exist: soft-delete to preserve data integrity
       await this.repo.softDelete(id);
+
+      // Invalidate cache
+      await Promise.all([
+        redisService.del(buildProductDetailKey(id)),
+        redisService.delPattern(`${CACHE_NS.PRODUCTS_LIST}:*`),
+      ]);
+
       return {
         id,
         isSoftDeleted: true,
@@ -164,6 +193,13 @@ export class ProductService {
 
     // No historical order records: safe to hard delete
     await this.repo.hardDelete(id);
+
+    // Invalidate cache
+    await Promise.all([
+      redisService.del(buildProductDetailKey(id)),
+      redisService.delPattern(`${CACHE_NS.PRODUCTS_LIST}:*`),
+    ]);
+
     return {
       id,
       isSoftDeleted: false,

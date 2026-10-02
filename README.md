@@ -9,13 +9,13 @@ A production-grade, high-performance Order Processing & Inventory Management RES
 - **Runtime & Language:** Node.js (v22+), TypeScript (Strict Mode)
 - **Web Framework:** Express.js
 - **Database & ORM:** PostgreSQL 18, Prisma ORM 7 (`@prisma/adapter-pg`)
-- **In-Memory Store & Cache:** Redis _(configured for future phases)_
+- **In-Memory Cache:** Redis 7, ioredis 6 (cache-aside pattern, stampede protection)
 - **Job & Queue Management:** BullMQ _(configured for future phases)_
 - **Validation:** Zod
 - **Structured Logging:** Pino, Pino-HTTP, Pino-Pretty
-- **Testing:** Jest, Supertest, ts-jest
+- **Testing:** Jest, Supertest, ts-jest, ioredis-mock
 - **Code Quality:** ESLint (Flat Config), Prettier
-- **Containerization:** Docker, Docker Compose _(prepared for future phases)_
+- **Containerization:** Docker, Docker Compose (Redis service included)
 
 ---
 
@@ -920,3 +920,114 @@ npm run lint
 npm run format:check
 npm run build
 ```
+
+---
+
+## Phase 9 — Redis Caching & Cache Invalidation
+
+### Overview
+
+Phase 9 introduces Redis caching via the **cache-aside pattern** to reduce redundant PostgreSQL queries on read-heavy, stable data.
+
+**Cached resources:** Products and Categories only.
+**Not cached:** Inventory, Orders, Auth tokens.
+
+### Architecture
+
+```text
+Request
+  ↓
+Service
+  ├─ withCache(key, fetcher)
+  │    ├─ Redis HIT  → return parsed JSON
+  │    └─ Redis MISS → acquire lock → fetch DB → store in Redis → return
+  └─ On Redis failure → fallback to DB transparently
+```
+
+### Infrastructure
+
+| File | Purpose |
+|---|---|
+| `src/infrastructure/redis/redis.client.ts` | Singleton ioredis client, lazy connect, graceful failure |
+| `src/infrastructure/redis/redis.service.ts` | `get`, `set`, `del`, `delPattern` (SCAN-based), `acquireLock`, `releaseLock` |
+| `src/infrastructure/redis/redis.constants.ts` | Cache namespace prefixes, lock config |
+| `src/common/cache/cache-key.builder.ts` | Deterministic sorted-param key builders |
+| `src/common/cache/cache.helper.ts` | `withCache()` — cache-aside with stampede protection |
+
+### Cache Key Strategy
+
+```text
+cache:products:list:{sorted-query-params}     # Product list with all filter/sort/page params
+cache:products:detail:{productId}             # Single product detail
+cache:categories:list:{sorted-query-params}   # Category list
+cache:categories:detail:{categoryId}          # Single category detail
+cache:lock:{main-key}                         # Distributed lock key (5s TTL, NX)
+```
+
+### Stampede Protection
+
+When a cache key is missing:
+
+1. Attempt to acquire a distributed lock (`SET key token NX EX 5`).
+2. If acquired → double-check cache (another process may have populated it) → fetch DB → populate cache → release lock.
+3. If not acquired → fall through directly to DB (no waiting, avoids lock-wait pile-up).
+4. Lock is always released in `finally` and auto-expires after 5 seconds.
+
+### Cache Invalidation Strategy
+
+Cache is invalidated **after** the DB write succeeds (never before):
+
+| Operation | Invalidated Keys |
+|---|---|
+| `createProduct` | All product list keys (`cache:products:list:*`) |
+| `updateProduct` | Product detail key + all product list keys |
+| `deleteProduct` (hard or soft) | Product detail key + all product list keys |
+| `createCategory` | All category list keys (`cache:categories:list:*`) |
+| `updateCategory` | Category detail key + all category list keys |
+| `deleteCategory` | Category detail key + all category list keys |
+
+Pattern deletion uses Redis `SCAN` (cursor-based) instead of `KEYS` to avoid blocking the server.
+
+### Graceful Redis Failure
+
+All Redis operations are wrapped in try/catch. If Redis is unavailable:
+- `get` returns `null` (triggers cache miss → DB fallback)
+- `set`, `del`, `delPattern`, lock operations are silent no-ops
+- No error is surfaced to the HTTP client
+
+### Configuration
+
+```env
+REDIS_URL=redis://localhost:6379
+CACHE_TTL_SECONDS=300
+```
+
+### Starting Redis (Development)
+
+Use the included Docker Compose:
+
+```bash
+# Start Redis
+docker compose up -d redis
+
+# Verify
+docker compose ps
+```
+
+### Testing
+
+Cache tests use `ioredis-mock` — no live Redis required for CI:
+
+```bash
+npx jest --testPathPatterns="cache"
+```
+
+**Test coverage (25 tests):**
+
+| Suite | Tests |
+|---|---|
+| `cache-key.builder` | Deterministic keys, empty param filtering |
+| `redisService` | get/set/del/delPattern, lock acquire/release, null-client fallback |
+| `withCache` | Cache miss → DB, cache hit, corruption recovery, Redis-null fallback, stampede (2nd wave) |
+| `ProductService — caching` | Detail caching, update invalidation |
+| `CategoryService — caching` | Detail caching, delete invalidation, create list invalidation |
