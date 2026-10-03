@@ -68,14 +68,14 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   // 4. Unexpected server errors
   logger.error({ err }, '[UnhandledError] Unexpected server error');
 
-  return res.status(500).json({
-    success: false,
-    error: {
-      code: ErrorCode.INTERNAL_SERVER_ERROR,
-      message:
-        config.NODE_ENV === 'production'
-          ? 'Internal server error'
-          : err.message || 'An unexpected error occurred',
-    },
-  });
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: ErrorCode.INTERNAL_SERVER_ERROR,
+        message:
+          config.NODE_ENV === 'production'
+            ? 'An unexpected error occurred.'
+            : err.message || 'An unexpected error occurred',
+      },
+    });
 };
