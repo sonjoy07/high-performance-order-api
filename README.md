@@ -2,7 +2,7 @@
 
 A high-performance Order Processing & Inventory Management REST API built with Node.js, Express, TypeScript, PostgreSQL, Prisma ORM, Redis, BullMQ, and modern backend architectural patterns.
 
-Designed to handle high-concurrency order placement, strict inventory consistency with zero overselling, customer-scoped idempotent request retries, distributed cache-aside caching, and asynchronous event-driven background processing.
+Designed to handle high-concurrency order placement, strict inventory consistency and overselling prevention under concurrent requests, customer-scoped idempotent request retries, distributed cache-aside caching, and asynchronous event-driven background processing.
 
 ---
 
@@ -39,7 +39,7 @@ Designed to handle high-concurrency order placement, strict inventory consistenc
 `high-performance-order-api` solves the core architectural challenges of high-volume e-commerce order management:
 
 1. **Race Conditions & Overselling:** Prevents overselling when concurrent requests compete for the same stock using PostgreSQL row-level locks (`SELECT ... FOR UPDATE`).
-2. **Deadlock Elimination:** Uses deterministic lock acquisition ordering (alphabetical sort by `productId`) to avoid cyclic dependency deadlocks during multi-product order checkout.
+2. **Deadlock Risk Reduction:** Uses deterministic lock acquisition ordering (alphabetical sort by `productId`) to avoid cyclic dependency deadlocks during multi-product order checkout.
 3. **Safe Network Retries:** Employs customer-scoped `Idempotency-Key` headers with SHA-256 payload hashing to ensure duplicate network transmissions return the original response without creating duplicate orders or reservations.
 4. **Decoupled Background Tasks:** Uses BullMQ and Redis to process order notifications and side effects outside of the synchronous database transaction.
 5. **Read Scalability:** Employs Redis cache-aside caching with automated pattern-based invalidation, TTLs, and lock-based cache stampede mitigation.
@@ -146,13 +146,13 @@ The codebase enforces a clean, layered architecture with strict separation of co
 ## Key Technical Decisions
 
 ### 1. Transactional Order Creation
-Order creation spans six database tables: `orders`, `order_items`, `inventories`, `stock_reservations`, `inventory_movements`, and `order_status_history`. Wrapping these operations in a single atomic PostgreSQL transaction guarantees ACID consistency: if any item lacks stock or any constraint fails, the entire transaction rolls back cleanly with no orphan records.
+Order creation spans seven database tables within a single atomic PostgreSQL transaction: `orders`, `order_items`, `inventories`, `stock_reservations`, `inventory_movements`, `order_status_history`, and `idempotency_keys`. Wrapping these operations atomically guarantees ACID consistency: if any item lacks stock or any constraint fails, the entire transaction rolls back cleanly with no orphan records.
 
 ### 2. Pessimistic Concurrency Control (`SELECT ... FOR UPDATE`)
 Stock availability is checked and updated under row-level exclusive locks acquired via `SELECT ... FOR UPDATE`. Competing transactions for the same inventory rows queue at the database level and read the freshly committed stock values upon acquiring the lock, preventing race conditions and overselling.
 
 ### 3. Deterministic Lock Ordering
-When an order contains multiple products, their IDs are normalized, merged, and sorted alphabetically before acquiring locks. Every concurrent transaction attempts to acquire locks in the exact same order (A -> B -> C). This eliminates circular wait conditions, significantly reducing deadlock risk under high concurrency.
+When an order contains multiple products, their IDs are normalized, merged, and sorted alphabetically before acquiring locks. Every concurrent transaction attempts to acquire locks in the exact same order (A -> B -> C). This reduces the risk of circular-wait deadlocks by acquiring product locks in a deterministic order, significantly reducing deadlock risk under high concurrency.
 
 ### 4. Stock Reservation Pattern
 Order placement increments `reservedQuantity` without altering physical `quantity`. Goods remain accounted for during warehouse audits. If an order is cancelled or expires, the reservation is released (`reservedQuantity -= held`) without altering physical inventory. Physical stock is only decremented upon fulfillment.
@@ -161,13 +161,13 @@ Order placement increments `reservedQuantity` without altering physical `quantit
 Order creation requires an `Idempotency-Key` header. Requests compute a canonical SHA-256 hash of the customer identity and items. The key is claimed inside the database transaction. Duplicate requests return the original response without re-executing inventory reservations, while payload mismatches under the same key return `409 IDEMPOTENCY_KEY_REUSED`.
 
 ### 6. Cache-Aside with Stampede Mitigation
-Catalogue data (products and categories) uses a Redis cache-aside strategy with configurable TTLs. To mitigate cache stampedes on popular uncached keys, the `withCache` helper acquires a short-lived Redis mutex lock (`SET lock:key token EX lockTtl NX`) so that only one worker fetches from PostgreSQL while concurrent reads wait or read the repopulated cache.
+Catalogue data (products and categories) uses a Redis cache-aside strategy with configurable TTLs. To mitigate cache stampedes on popular uncached keys, the `withCache` helper attempts to acquire a short-lived Redis mutex lock (`SET lock:key token EX lockTtl NX`). On a cache miss, one process attempts to populate the cache from PostgreSQL while requests that cannot acquire the lock fall back to PostgreSQL directly without blocking.
 
 ### 7. Decoupled Asynchronous Workers
 Order event notifications (`ORDER_CREATED`, `ORDER_CANCELLED`, etc.) are queued to BullMQ **after** the database transaction has committed. A dedicated worker process handles notifications with 3 retry attempts and exponential backoff. The worker enforces idempotency by recording processed events in a PostgreSQL `processed_jobs` table.
 
 ### 8. Stateless JWT with Refresh Token Rotation
-Authentication uses short-lived JWT access tokens (15m) and long-lived refresh tokens (7d). Refresh tokens are stored in the database as SHA-256 hashes. Upon refresh, the presented token is revoked and a new pair is issued (rotation). If a revoked token is presented, the system treats it as potential reuse and blocks the request.
+Authentication uses short-lived JWT access tokens (15m) and long-lived refresh tokens (7d). Refresh tokens are JWTs signed with `JWT_REFRESH_SECRET`. The SHA-256 hash of the refresh token JWT string is stored in PostgreSQL for revocation and rotation. Upon refresh, the presented token is verified, revoked, and a new pair is issued. If a revoked token is presented, the system treats it as potential reuse and blocks the request.
 
 ---
 
@@ -273,7 +273,7 @@ The schema models an enterprise order-processing engine with strict referential 
 
 1. **Trigram GIN Indexes (`pg_trgm`):**
    - Applied to `products(name)`, `products(sku)`, and `orders(orderNumber)`.
-   - Enables fast `ILIKE '%term%'` substring searches backed by index scans instead of sequential table scans.
+   - PostgreSQL trigram GIN indexes support efficient `ILIKE '%term%'` substring/search operations, enabling faster lookups compared to sequential table scans on large datasets.
 2. **Composite B-Tree Indexes for Access Paths:**
    - `orders(customerId, createdAt, id)`: Serves customer order history with pagination and deterministic sorting.
    - `orders(status, createdAt, id)`: Serves administrative order status filtering with total tiebreaker ordering.
@@ -436,11 +436,12 @@ API Server                                            Worker Process
 
 ### Worker Configuration
 
-- **Queue Name:** `order-events` (configurable via `QUEUE_PREFIX`).
+- **Queue Name:** `order-events`.
+- **QUEUE_PREFIX:** Configures the BullMQ Redis key namespace/prefix (default: `high-performance-order-api`).
 - **Concurrency:** 5 concurrent jobs per worker instance (`WORKER_CONCURRENCY`).
 - **Retry Strategy:** 3 attempts with exponential backoff (initial delay: 1,000ms -> 2,000ms -> 4,000ms).
 - **Job Retention:** Retains 100 completed jobs and 500 failed jobs for administrative inspection.
-- **Worker-Side Idempotency:** The worker records `(eventId, eventType)` in the `processed_jobs` table under a unique constraint. If a job is delivered more than once (at-least-once delivery), subsequent attempts are skipped without duplicate side effects.
+- **Worker-Side Idempotency:** The worker attempts to insert a record into the `processed_jobs` table with a unique constraint on `(eventId, eventType)`. If a duplicate event is detected (Prisma `P2002` unique constraint violation), the job is skipped silently to reduce duplicate side effects.
 - **Graceful Shutdown:** On `SIGTERM` / `SIGINT`, the worker finishes active jobs, closes BullMQ connections, disconnects Prisma, and exits cleanly.
 
 ---
@@ -450,7 +451,7 @@ API Server                                            Worker Process
 ### Token Architecture
 
 - **Access Token:** Stateless JWT, signed with `JWT_ACCESS_SECRET`, 15-minute lifetime (`JWT_ACCESS_EXPIRES_IN=15m`). Contains `userId` and `role`.
-- **Refresh Token:** Cryptographically random string, signed with `JWT_REFRESH_SECRET`, 7-day lifetime (`JWT_REFRESH_EXPIRES_IN=7d`). Stored in PostgreSQL as a SHA-256 hash (`refresh_tokens.tokenHash`).
+- **Refresh Token:** JWT signed with `JWT_REFRESH_SECRET`, 7-day lifetime (`JWT_REFRESH_EXPIRES_IN=7d`). The SHA-256 hash of the token string is stored in PostgreSQL (`refresh_tokens.tokenHash`) for revocation and rotation.
 
 ### Refresh Token Rotation & Revocation
 
@@ -850,7 +851,7 @@ Both the API and worker implement graceful termination:
 | `CACHE_TTL_SECONDS` | No | `300` | Default cache-aside Time-To-Live in seconds |
 | `QUEUE_PREFIX` | No | `high-performance-order-api` | Prefix for BullMQ Redis queue keys |
 | `WORKER_CONCURRENCY` | No | `5` | Maximum parallel jobs processed by the worker |
-| `JWT_SECRET` | Yes | `change-me` | Legacy secret key fallback |
+| `JWT_SECRET` | Yes | `change-me` | Checked against insecure defaults in production validation; not used for token signing |
 | `JWT_ACCESS_SECRET` | Yes | `change-me-access` | Cryptographic secret for signing access tokens (min 32 chars) |
 | `JWT_ACCESS_EXPIRES_IN` | No | `15m` | Lifetime of access tokens (`15m`, `1h`, etc.) |
 | `JWT_REFRESH_SECRET` | Yes | `change-me-refresh` | Cryptographic secret for signing refresh tokens (min 32 chars) |
@@ -932,7 +933,7 @@ npm run db:seed:perf
 
 This project represents a completed backend engineering assessment implementation:
 
-- [x] Strict concurrency control with zero overselling verified under automated tests.
+- [x] Concurrency control and overselling prevention are covered by automated tests.
 - [x] Safe request retries with customer-scoped database idempotency.
 - [x] Complete ACID transaction wrapping order creation, inventory reservations, movements, and status history.
 - [x] Robust cancellation workflow with atomic stock reservation release.
