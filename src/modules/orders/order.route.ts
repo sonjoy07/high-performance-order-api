@@ -123,6 +123,7 @@ router.get('/', authenticate, validateRequest({ query: orderQuerySchema }), orde
  */
 router.post(
   '/',
+  authenticate,
   orderCreationRateLimiter,
   validateRequest({ body: createOrderSchema }),
   orderController.createOrder
