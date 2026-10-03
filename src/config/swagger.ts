@@ -52,7 +52,7 @@ const options = {
       },
     ],
   },
-  apis: ['./src/modules/**/*.ts', './src/modules/**/*.js'],
+  apis: ['./src/**/*.ts', './dist/**/*.js'],
 };
 
 export const swaggerSpec = swaggerJsdoc(options);

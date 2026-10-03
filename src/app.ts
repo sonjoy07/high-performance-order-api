@@ -64,6 +64,8 @@ export const createApp = (): Express => {
 
   // ── API Documentation ──────────────────────────────────────────────────────
   app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+  app.get('/api/docs.json', (_req, res) => { res.setHeader('Content-Type', 'application/json'); res.send(swaggerSpec); });
+  app.get('/api/docs/swagger.json', (_req, res) => { res.setHeader('Content-Type', 'application/json'); res.send(swaggerSpec); });
 
   // ── Health / Readiness (no rate limiting — used by load balancers) ─────────
   app.use('/health', healthRouter);

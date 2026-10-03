@@ -25,7 +25,11 @@
     "db:seed:perf": "tsx prisma/seed.perf.ts",
     "db:seed:reset": "tsx prisma/seed.perf.ts --reset",
     "perf:explain": "tsx scripts/explain-analyze.ts",
-    "perf:queries": "tsx scripts/measure-queries.ts"
+    "perf:queries": "tsx scripts/measure-queries.ts",
+    "test:concurrency": "jest --runInBand --forceExit",
+    "test:unit": "jest --forceExit",
+    "test:performance": "jest --runInBand --forceExit",
+    "test:coverage": "jest --forceExit --coverage"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
