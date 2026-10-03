@@ -55,13 +55,12 @@ export async function enqueueOrderCreated(params: {
 
     const opts: JobsOptions = {
       ...JOB_DEFAULT_OPTS,
-      jobId: `order-created-${params.orderId.replace(/:/g, "-")}`, // deterministic — prevents accidental duplicate enqueue
+      jobId: `order-created-${params.orderId.replace(/:/g, '-')}`,
     };
 
     await queue.add(ORDER_EVENT_TYPES.ORDER_CREATED, payload, opts);
     logger.info({ orderId: params.orderId, eventId, jobId: opts.jobId }, 'ORDER_CREATED job enqueued');
   } catch (err) {
-    // Log but do NOT throw — queue failure must not break the order API response
     logger.error({ err, orderId: params.orderId }, 'Failed to enqueue ORDER_CREATED job');
   }
 }
@@ -88,7 +87,7 @@ export async function enqueueOrderCancelled(params: {
 
     const opts: JobsOptions = {
       ...JOB_DEFAULT_OPTS,
-      jobId: `order-cancelled-${params.orderId.replace(/:/g, "-")}`,
+      jobId: `order-cancelled-${params.orderId.replace(/:/g, '-')}`,
     };
 
     await queue.add(ORDER_EVENT_TYPES.ORDER_CANCELLED, payload, opts);
@@ -127,7 +126,7 @@ export async function enqueueOrderStatusChanged(params: {
 
     const opts: JobsOptions = {
       ...JOB_DEFAULT_OPTS,
-      jobId: `${eventType.toLowerCase().replace('_', '-')}:${params.orderId}`,
+      jobId: `${eventType.toLowerCase().replace(/_/g, '-')}-${params.orderId.replace(/:/g, '-')}`,
     };
 
     await queue.add(eventType, payload, opts);

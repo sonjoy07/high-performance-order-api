@@ -44,8 +44,8 @@ async function main() {
   });
   console.log(` Created admin user: ${adminUser.email}`);
 
-  // 4. Create Customer Users & Customer Profiles
-  console.log('Creating Customer Users & Profiles...');
+  // 4. Create Customer User & Profile
+  console.log('Creating Customer User & Profile...');
   const customerUser1 = await prisma.user.create({
     data: {
       email: 'john.doe@example.com',
@@ -62,26 +62,7 @@ async function main() {
     include: { customer: true },
   });
   console.log(
-    ` Created customer 1: ${customerUser1.email} (${customerUser1.customer?.firstName} ${customerUser1.customer?.lastName})`
-  );
-
-  const customerUser2 = await prisma.user.create({
-    data: {
-      email: 'jane.smith@example.com',
-      passwordHash: customerPasswordHash,
-      role: UserRole.CUSTOMER,
-      customer: {
-        create: {
-          firstName: 'Jane',
-          lastName: 'Smith',
-          phone: '+1-555-0102',
-        },
-      },
-    },
-    include: { customer: true },
-  });
-  console.log(
-    ` Created customer 2: ${customerUser2.email} (${customerUser2.customer?.firstName} ${customerUser2.customer?.lastName})`
+    ` Created customer: ${customerUser1.email} (${customerUser1.customer?.firstName} ${customerUser1.customer?.lastName})`
   );
 
   // 5. Create Categories
@@ -101,21 +82,11 @@ async function main() {
       description: 'Smart appliances, kitchenware, and modern home essentials',
     },
   });
-
-  const booksStationery = await prisma.category.create({
-    data: {
-      name: 'Books & Stationery',
-      slug: 'books-stationery',
-      description: 'Technical literature, notebooks, and premium writing instruments',
-    },
-  });
-
-  console.log(' Created 3 categories: Electronics, Home & Kitchen, Books & Stationery');
+  console.log(' Created 2 categories: Electronics, Home & Kitchen');
 
   // 6. Create Products with Inventory and Initial Stock Movement
   console.log('Creating Products, Inventories, and Audit Movements...');
   const productsData = [
-    // Electronics
     {
       categoryId: electronics.id,
       name: 'Wireless Noise-Cancelling Headphones Pro',
@@ -132,19 +103,8 @@ async function main() {
       description: 'Hot-swappable RGB backlit mechanical keyboard with ergonomic wrist rest.',
       sku: 'TECH-EMK-002',
       price: '129.50',
-      stock: 75,
+      stock: 10,
     },
-    {
-      categoryId: electronics.id,
-      name: 'Ultra-Wide 34-inch 144Hz Gaming Monitor',
-      slug: 'ultra-wide-34-inch-144hz-gaming-monitor',
-      description: 'Curved WQHD IPS display with HDR400 and AMD FreeSync Premium.',
-      sku: 'TECH-UWM-003',
-      price: '649.99',
-      stock: 35,
-    },
-
-    // Home & Kitchen
     {
       categoryId: homeKitchen.id,
       name: 'Digital Smart Air Fryer XL (6.5L)',
@@ -164,50 +124,10 @@ async function main() {
       price: '289.00',
       stock: 25,
     },
-    {
-      categoryId: homeKitchen.id,
-      name: 'Autonomous Robot Vacuum & Sonic Mop',
-      slug: 'autonomous-robot-vacuum-sonic-mop',
-      description: 'LiDAR precision navigation with auto-emptying dustbin and sonic scrubbing.',
-      sku: 'HOME-RVM-003',
-      price: '399.95',
-      stock: 45,
-    },
-
-    // Books & Stationery
-    {
-      categoryId: booksStationery.id,
-      name: 'Designing Data-Intensive Applications',
-      slug: 'designing-data-intensive-applications',
-      description:
-        'The definitive guide to distributed systems, scalability, and data reliability.',
-      sku: 'BOOK-DDIA-001',
-      price: '49.99',
-      stock: 150,
-    },
-    {
-      categoryId: booksStationery.id,
-      name: 'Hardcover Dot-Grid Technical Notebook',
-      slug: 'hardcover-dot-grid-technical-notebook',
-      description: '160gsm bleed-proof bamboo paper notebook with dual bookmarks and index.',
-      sku: 'STAT-HDTN-002',
-      price: '24.95',
-      stock: 200,
-    },
-    {
-      categoryId: booksStationery.id,
-      name: 'Precision Fountain Pen Executive Set',
-      slug: 'precision-fountain-pen-executive-set',
-      description:
-        'Handcrafted titanium nib fountain pen with converter and archived black ink bottle.',
-      sku: 'STAT-PFPE-003',
-      price: '85.00',
-      stock: 65,
-    },
   ];
 
   for (const item of productsData) {
-    const product = await prisma.product.create({
+    await prisma.product.create({
       data: {
         categoryId: item.categoryId,
         name: item.name,
@@ -232,14 +152,81 @@ async function main() {
           },
         },
       },
-      include: {
-        inventory: true,
+    });
+  }
+
+  const products = await prisma.product.findMany({ include: { inventory: true } });
+  const customer = await prisma.customer.findUnique({
+    where: { userId: customerUser1.id },
+  });
+
+  if (customer && products.length >= 2) {
+    const p1 = products[0];
+    const p2 = products[1];
+
+    // Order 1
+    await prisma.order.create({
+      data: {
+        customerId: customer.id,
+        orderNumber: 'ORD-SEED-001',
+        status: 'CONFIRMED',
+        totalAmount: (Number(p1.price) * 2).toFixed(2),
+        items: {
+          create: [
+            {
+              productId: p1.id,
+              quantity: 2,
+              unitPrice: p1.price,
+              totalPrice: (Number(p1.price) * 2).toFixed(2),
+            },
+          ],
+        },
+        statusHistory: {
+          create: [
+            { fromStatus: null, toStatus: 'PENDING', changedBy: customerUser1.id },
+            { fromStatus: 'PENDING', toStatus: 'CONFIRMED', changedBy: adminUser.id },
+          ],
+        },
       },
     });
 
-    console.log(
-      ` Created product: ${product.name} [SKU: ${product.sku}, Stock: ${product.inventory?.quantity}, Price: $${product.price}]`
-    );
+    // Order 2
+    const order2 = await prisma.order.create({
+      data: {
+        customerId: customer.id,
+        orderNumber: 'ORD-SEED-002',
+        status: 'SHIPPED',
+        totalAmount: Number(p2.price).toFixed(2),
+        items: {
+          create: [
+            {
+              productId: p2.id,
+              quantity: 1,
+              unitPrice: p2.price,
+              totalPrice: Number(p2.price).toFixed(2),
+            },
+          ],
+        },
+        statusHistory: {
+          create: [
+            { fromStatus: null, toStatus: 'PENDING', changedBy: customerUser1.id },
+            { fromStatus: 'PENDING', toStatus: 'CONFIRMED', changedBy: adminUser.id },
+            { fromStatus: 'CONFIRMED', toStatus: 'PROCESSING', changedBy: adminUser.id },
+            { fromStatus: 'PROCESSING', toStatus: 'SHIPPED', changedBy: adminUser.id },
+          ],
+        },
+      },
+    });
+
+    await prisma.inventoryMovement.create({
+      data: {
+        productId: p2.id,
+        type: InventoryMovementType.STOCK_OUT,
+        quantity: 1,
+        referenceType: 'ORDER',
+        referenceId: order2.id,
+      },
+    });
   }
 
   console.log('✅ Database seed completed successfully!');
