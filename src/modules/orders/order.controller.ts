@@ -1,6 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { OrderStatus, UserRole } from '@prisma/client';
-import { prisma } from '../../config/prisma';
+import { OrderStatus } from '@prisma/client';
 import { OrderService, orderService as defaultOrderService } from './order.service';
 import { CreateOrderItemInput } from './order.types';
 import {
@@ -10,7 +9,7 @@ import {
   orderQuerySchema,
   updateOrderStatusSchema,
 } from './order.validation';
-import { AuthenticationError, CustomerNotFoundError } from '../../common/errors/app.error';
+import { AuthenticationError } from '../../common/errors/app.error';
 
 export interface CreateOrderRequestBody {
   items: CreateOrderItemInput[];
@@ -33,35 +32,14 @@ export class OrderController {
       // Validate request body
       createOrderSchema.parse(req.body);
 
-      // Derive customer strictly from authenticated user token
-      let customer = await prisma.customer.findUnique({
-        where: { userId: req.user.id },
-      });
-
-      if (!customer) {
-        if (req.user.role === UserRole.ADMIN) {
-          customer = await prisma.customer.create({
-            data: {
-              userId: req.user.id,
-              firstName: 'Admin',
-              lastName: 'User',
-            },
-          });
-        } else {
-          throw new CustomerNotFoundError(
-            'Authenticated user does not have an associated customer profile'
-          );
-        }
-      }
+      // Derive customer strictly from authenticated user token — never trust client-supplied customerId.
+      // Customer lookup/creation is delegated to the service layer.
+      const customerId = await this.orderService.resolveCustomerForUser(req.user);
 
       const idempotencyKey = req.headers['idempotency-key'];
 
-      // Note: We deliberately use derived customer.id, overriding any client-supplied customerId
       const result = await this.orderService.createOrder(
-        {
-          customerId: customer.id,
-          items: req.body.items,
-        },
+        { customerId, items: req.body.items },
         idempotencyKey
       );
 

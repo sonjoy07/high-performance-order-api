@@ -55,7 +55,7 @@ export async function enqueueOrderCreated(params: {
 
     const opts: JobsOptions = {
       ...JOB_DEFAULT_OPTS,
-      jobId: `order-created:${params.orderId}`, // deterministic — prevents accidental duplicate enqueue
+      jobId: `order-created-${params.orderId.replace(/:/g, "-")}`, // deterministic — prevents accidental duplicate enqueue
     };
 
     await queue.add(ORDER_EVENT_TYPES.ORDER_CREATED, payload, opts);
@@ -88,7 +88,7 @@ export async function enqueueOrderCancelled(params: {
 
     const opts: JobsOptions = {
       ...JOB_DEFAULT_OPTS,
-      jobId: `order-cancelled:${params.orderId}`,
+      jobId: `order-cancelled-${params.orderId.replace(/:/g, "-")}`,
     };
 
     await queue.add(ORDER_EVENT_TYPES.ORDER_CANCELLED, payload, opts);

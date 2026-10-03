@@ -1,4 +1,4 @@
-import crypto from 'crypto';
+﻿import crypto from 'crypto';
 import {
   InventoryMovementType,
   Order,
@@ -60,7 +60,7 @@ import {
   mergeAndSortOrderItems,
   OrderQueryInput,
 } from './order.validation';
-import { enqueueOrderCreated } from '../../queues/queues';
+import { enqueueOrderCreated, enqueueOrderCancelled, enqueueOrderStatusChanged } from '../../queues/queues';
 
 
 export interface CreateOrderResult {
@@ -76,6 +76,32 @@ export class OrderService {
     private readonly idempotencyRepo: IdempotencyRepository = defaultIdempotencyRepo,
     private readonly idempotencyService: IdempotencyService = defaultIdempotencyService
   ) {}
+
+  /**
+   * Resolves the Customer identity for the authenticated user.
+   *
+   * - If the user already has an associated Customer profile, returns its ID.
+   * - If the user is an ADMIN with no Customer profile, one is auto-created.
+   * - If the user is a CUSTOMER with no profile, throws CustomerNotFoundError.
+   *
+   * This is intentionally NOT inside the order transaction — the customer record
+   * must exist before the transactional order creation begins.
+   */
+  public async resolveCustomerForUser(user: { id: string; role: UserRole }): Promise<string> {
+    let customer = await this.orderRepo.findCustomerByUserId(user.id);
+
+    if (!customer) {
+      if (user.role === UserRole.ADMIN) {
+        customer = await this.orderRepo.createCustomerForUser(user.id, 'Admin', 'User');
+      } else {
+        throw new CustomerNotFoundError(
+          'Authenticated user does not have an associated customer profile'
+        );
+      }
+    }
+
+    return customer.id;
+  }
 
   /**
    * Generates a robust, collision-resistant unique order number.
@@ -668,7 +694,9 @@ export class OrderService {
         'Order cancelled and reserved stock successfully released'
       );
 
-      return this.formatOrderResponse(updatedOrder);
+      const response = this.formatOrderResponse(updatedOrder);
+      void enqueueOrderCancelled({ orderId: updatedOrder.id, customerId: order.customerId, reason });
+      return response;
     });
   }
 
@@ -729,7 +757,9 @@ export class OrderService {
         'Order status updated successfully'
       );
 
-      return this.formatOrderResponse(updatedOrder);
+      const response = this.formatOrderResponse(updatedOrder);
+      void enqueueOrderStatusChanged({ orderId: updatedOrder.id, newStatus: updatedOrder.status });
+      return response;
     });
   }
 
@@ -770,3 +800,4 @@ export class OrderService {
 }
 
 export const orderService = new OrderService();
+

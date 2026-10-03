@@ -235,6 +235,20 @@ export class OrderRepository {
   }
 
   /**
+   * Creates a Customer profile for a User who doesn't have one yet.
+   * Used primarily for Admin users placing orders for the first time.
+   */
+  public async createCustomerForUser(
+    userId: string,
+    firstName: string,
+    lastName: string
+  ): Promise<Customer> {
+    return prisma.customer.create({
+      data: { userId, firstName, lastName },
+    });
+  }
+
+  /**
    * Creates an order with nested order items within an active transaction.
    */
   public async createOrder(
