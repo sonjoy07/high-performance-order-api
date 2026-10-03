@@ -1,624 +1,476 @@
 # high-performance-order-api
 
-A high-performance Order Processing & Inventory Management REST API built with Node.js, Express, TypeScript, PostgreSQL, Prisma ORM, and modern backend architectural patterns.
+A high-performance Order Processing & Inventory Management REST API built with Node.js, Express, TypeScript, PostgreSQL, Prisma ORM, Redis, BullMQ, and modern backend architectural patterns.
+
+Designed to handle high-concurrency order placement, strict inventory consistency with zero overselling, customer-scoped idempotent request retries, distributed cache-aside caching, and asynchronous event-driven background processing.
+
+---
+
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Architecture & Layering](#architecture--layering)
+- [Key Technical Decisions](#key-technical-decisions)
+- [Project Structure](#project-structure)
+- [Database Design & Indexing](#database-design--indexing)
+- [Concurrency & Overselling Prevention](#concurrency--overselling-prevention)
+- [Idempotency & Safe Request Retries](#idempotency--safe-request-retries)
+- [Caching & Stampede Mitigation](#caching--stampede-mitigation)
+- [Background Processing & Queue Architecture](#background-processing--queue-architecture)
+- [Authentication & Authorization](#authentication--authorization)
+- [Order Lifecycle & Status Management](#order-lifecycle--status-management)
+- [API Documentation (Swagger / OpenAPI)](#api-documentation-swagger--openapi)
+- [API Endpoints](#api-endpoints)
+- [Error Handling Standards](#error-handling-standards)
+- [Testing & Verification](#testing--verification)
+- [Local Development Setup](#local-development-setup)
+- [Docker & Production Runtime](#docker--production-runtime)
+- [Environment Variables](#environment-variables)
+- [Database Migrations & Seeding](#database-migrations--seeding)
+- [Production Considerations & Architectural Trade-offs](#production-considerations--architectural-trade-offs)
+- [Submission Notes](#submission-notes)
+
+---
+
+## Project Overview
+
+`high-performance-order-api` solves the core architectural challenges of high-volume e-commerce order management:
+
+1. **Race Conditions & Overselling:** Prevents overselling when concurrent requests compete for the same stock using PostgreSQL row-level locks (`SELECT ... FOR UPDATE`).
+2. **Deadlock Elimination:** Uses deterministic lock acquisition ordering (alphabetical sort by `productId`) to avoid cyclic dependency deadlocks during multi-product order checkout.
+3. **Safe Network Retries:** Employs customer-scoped `Idempotency-Key` headers with SHA-256 payload hashing to ensure duplicate network transmissions return the original response without creating duplicate orders or reservations.
+4. **Decoupled Background Tasks:** Uses BullMQ and Redis to process order notifications and side effects outside of the synchronous database transaction.
+5. **Read Scalability:** Employs Redis cache-aside caching with automated pattern-based invalidation, TTLs, and lock-based cache stampede mitigation.
+6. **Strict Access Boundaries:** Enforces JWT-based authentication, database-persisted refresh token rotation with reuse detection, and Role-Based Access Control (`CUSTOMER`, `ADMIN`) with ownership verification (IDOR protection).
+
+---
+
+## Features
+
+- **Category & Product Management:** Full CRUD with hierarchical categorization, trigram GIN-indexed full-text search across names and SKUs, active-state filtering, and soft-delete safeguards for products with order history.
+- **Inventory Tracking & Auditing:** Real-time physical vs reserved stock tracking, dynamic available quantity calculation (quantity - reservedQuantity), manual stock adjustments (`STOCK_IN`, `STOCK_OUT`, `ADJUSTMENT`), and an immutable movement audit ledger.
+- **Transactional Order Placement:** Atomic order creation, inventory reservation, order line persistence, and status history logging within a single PostgreSQL transaction.
+- **Order Cancellation & Stock Release:** Transaction-safe cancellation from `PENDING` or `CONFIRMED` status, releasing active stock reservations and recording `RELEASE` inventory movements.
+- **Order Status State Machine:** Centralized transition matrix governing order status progression (`PENDING` -> `CONFIRMED` -> `PROCESSING` -> `SHIPPED` -> `DELIVERED`).
+- **Idempotent Order Creation:** Client-driven idempotency keys with payload validation, automatic transaction rollback on failure (no poisoned keys), and concurrent duplicate synchronization via database unique constraints.
+- **Redis Caching:** Cache-aside caching for categories and products with SCAN-based pattern invalidation on mutations and distributed lock-based stampede mitigation.
+- **Asynchronous Workers:** BullMQ-based background worker handling domain events (`ORDER_CREATED`, `ORDER_CANCELLED`, `ORDER_CONFIRMED`, `ORDER_PROCESSING`, `ORDER_SHIPPED`, `ORDER_DELIVERED`) with exponential backoff retries and worker-side idempotency tracking via `ProcessedJob`.
+- **Administrative Reporting:** Database-aggregated metrics for order totals, status distribution, daily/monthly revenue time series, and product sales rankings.
+- **Security & Rate Limiting:** Layered security using Helmet headers, CORS restrictions, request ID tracking (`X-Request-ID`), and tiered rate limiters (global, authentication, order creation) backed by Redis.
+- **Interactive API Documentation:** Full OpenAPI 3.0 specification served via Swagger UI at `/api/docs`.
+- **Production Containerization:** Multi-stage Docker build with non-root user execution, `dumb-init` signal handling, Docker Compose orchestration with PostgreSQL 16, Redis 7, API server, and background worker.
 
 ---
 
 ## Tech Stack
 
-- **Runtime & Language:** Node.js (v22+), TypeScript (Strict Mode)
-- **Web Framework:** Express.js
-- **Database & ORM:** PostgreSQL 18, Prisma ORM 7 (`@prisma/adapter-pg`)
-- **In-Memory Cache:** Redis 7, ioredis 6 (cache-aside pattern, stampede protection)
-- **Job & Queue Management:** BullMQ _(configured for future phases)_
-- **Validation:** Zod
-- **Structured Logging:** Pino, Pino-HTTP, Pino-Pretty
-- **Testing:** Jest, Supertest, ts-jest, ioredis-mock
-- **Code Quality:** ESLint (Flat Config), Prettier
-- **Containerization:** Docker, Docker Compose (Redis service included)
+| Layer | Technology | Version | Purpose |
+|---|---|---|---|
+| **Runtime** | Node.js | v22+ (LTS) | Server runtime environment |
+| **Language** | TypeScript | v6.0 | Strict-mode type safety across all layers |
+| **Framework** | Express.js | v5.2 | HTTP routing, middleware, and request dispatching |
+| **Database** | PostgreSQL | 16 (Alpine) | ACID relational storage, row locking, trigram indexing |
+| **ORM / Driver** | Prisma ORM | v7.10 | Type-safe schema, migrations, `@prisma/adapter-pg` driver |
+| **Cache & Store** | Redis | 7 (Alpine) | Cache-aside caching, rate limiting store, BullMQ message broker |
+| **Redis Client** | ioredis | v6.0 | High-performance Redis client with connection pooling & Lua support |
+| **Queue / Worker** | BullMQ | v6.3 | Job queues, delayed retries, exponential backoff, worker concurrency |
+| **Validation** | Zod | v4.6 | Runtime request payload, query, and parameter schema validation |
+| **Logging** | Pino & Pino-HTTP | v10.3 / v11.0 | Fast JSON structured logging with request correlation IDs |
+| **Authentication** | jsonwebtoken & bcryptjs | v9.0 / v3.0 | Stateless JWT signing, bcrypt password hashing (10 rounds) |
+| **Rate Limiting** | express-rate-limit | v8.7 | Rate limiting middleware with Redis store integration (`rate-limit-redis`) |
+| **Security** | Helmet & CORS | v8.3 / v2.8 | HTTP security headers and Cross-Origin Resource Sharing control |
+| **API Docs** | Swagger JSDoc & UI | v6.3 / v5.0 | OpenAPI 3.0 specification generation and interactive documentation |
+| **Testing** | Jest & Supertest | v30.5 / v7.3 | Integration, concurrency, unit, and API regression testing |
+| **Test Mocks** | ioredis-mock | v8.13 | In-memory Redis simulation for isolated test execution |
+| **Process Control** | dumb-init | Alpine | PID 1 init system for container signal handling and zombie reaping |
 
 ---
 
 ## Architecture & Layering
 
-The project adheres to a strict separation of concerns across all modules:
+The codebase enforces a clean, layered architecture with strict separation of concerns:
 
 ```text
-Route             → HTTP method and path mapping + Zod request validation
-  ↓
-Controller        → Request unwrapping, parameter extraction, response serialization (No business rules)
-  ↓
-Service           → Domain rules, business constraints, coordination across repositories
-  ↓
-Repository        → Direct Prisma queries, database projections, atomic transactions
-  ↓
-Prisma ORM       → Type-safe query engine via @prisma/adapter-pg
-  ↓
-PostgreSQL        → Relational persistence with B-Tree indexes and referential integrity
+                           ┌─────────────────────────┐
+                           │      HTTP Client        │
+                           └────────────┬────────────┘
+                                        │
+                                        ▼
+                           ┌─────────────────────────┐
+                           │   Express Application   │
+                           │ (Middleware, Rate Limit,│
+                           │  Helmet, Request ID)    │
+                           └────────────┬────────────┘
+                                        │
+                                        ▼
+                           ┌─────────────────────────┐
+                           │       Controller        │  HTTP unwrapping & status codes
+                           └────────────┬────────────┘  (No business logic / direct DB)
+                                        │
+                                        ▼
+                           ┌─────────────────────────┐
+                           │     Service Layer       │  Domain logic, transactions,
+                           └──────┬───────────┬──────┘  cache & queue coordination
+                                  │           │
+                     ┌────────────┘           └────────────┐
+                     ▼                                     ▼
+        ┌─────────────────────────┐           ┌─────────────────────────┐
+        │       Repository        │           │   Infrastructure Layer  │
+        │ (Prisma Client queries) │           │ (Redis Client / BullMQ) │
+        └────────────┬────────────┘           └────────────┬────────────┘
+                     │                                     │
+                     ▼                                     ▼
+        ┌─────────────────────────┐           ┌─────────────────────────┐
+        │       PostgreSQL 16     │           │         Redis 7         │
+        └─────────────────────────┘           └────────────┬────────────┘
+                                                           │
+                                                           ▼
+                                              ┌─────────────────────────┐
+                                              │      BullMQ Worker      │
+                                              │  (Notification Service) │
+                                              └─────────────────────────┘
 ```
 
-### Folder Structure
+### Layer Responsibilities
+
+1. **Routes & Middleware:** URL routing, request parsing, authentication token verification, rate limiting, and Zod schema validation before passing control to controllers.
+2. **Controllers:** Extract HTTP request inputs (`params`, `query`, `body`, `user`), invoke service methods, format output responses, and forward unhandled exceptions to error middleware. Controllers do not execute Prisma queries directly.
+3. **Services:** Core business logic, transaction boundaries (`prisma.$transaction`), domain state validation, inventory availability checks, and post-commit background job scheduling.
+4. **Repositories:** Data access layer encapsulating Prisma model queries, query projection, ordering, pagination parameters, and explicit locking statements.
+5. **Infrastructure:** Redis client management, cache key builders, distributed locking helpers, BullMQ queue definitions, and worker processors.
+
+---
+
+## Key Technical Decisions
+
+### 1. Transactional Order Creation
+Order creation spans six database tables: `orders`, `order_items`, `inventories`, `stock_reservations`, `inventory_movements`, and `order_status_history`. Wrapping these operations in a single atomic PostgreSQL transaction guarantees ACID consistency: if any item lacks stock or any constraint fails, the entire transaction rolls back cleanly with no orphan records.
+
+### 2. Pessimistic Concurrency Control (`SELECT ... FOR UPDATE`)
+Stock availability is checked and updated under row-level exclusive locks acquired via `SELECT ... FOR UPDATE`. Competing transactions for the same inventory rows queue at the database level and read the freshly committed stock values upon acquiring the lock, preventing race conditions and overselling.
+
+### 3. Deterministic Lock Ordering
+When an order contains multiple products, their IDs are normalized, merged, and sorted alphabetically before acquiring locks. Every concurrent transaction attempts to acquire locks in the exact same order (A -> B -> C). This eliminates circular wait conditions, significantly reducing deadlock risk under high concurrency.
+
+### 4. Stock Reservation Pattern
+Order placement increments `reservedQuantity` without altering physical `quantity`. Goods remain accounted for during warehouse audits. If an order is cancelled or expires, the reservation is released (`reservedQuantity -= held`) without altering physical inventory. Physical stock is only decremented upon fulfillment.
+
+### 5. Client-Driven Idempotency
+Order creation requires an `Idempotency-Key` header. Requests compute a canonical SHA-256 hash of the customer identity and items. The key is claimed inside the database transaction. Duplicate requests return the original response without re-executing inventory reservations, while payload mismatches under the same key return `409 IDEMPOTENCY_KEY_REUSED`.
+
+### 6. Cache-Aside with Stampede Mitigation
+Catalogue data (products and categories) uses a Redis cache-aside strategy with configurable TTLs. To mitigate cache stampedes on popular uncached keys, the `withCache` helper acquires a short-lived Redis mutex lock (`SET lock:key token EX lockTtl NX`) so that only one worker fetches from PostgreSQL while concurrent reads wait or read the repopulated cache.
+
+### 7. Decoupled Asynchronous Workers
+Order event notifications (`ORDER_CREATED`, `ORDER_CANCELLED`, etc.) are queued to BullMQ **after** the database transaction has committed. A dedicated worker process handles notifications with 3 retry attempts and exponential backoff. The worker enforces idempotency by recording processed events in a PostgreSQL `processed_jobs` table.
+
+### 8. Stateless JWT with Refresh Token Rotation
+Authentication uses short-lived JWT access tokens (15m) and long-lived refresh tokens (7d). Refresh tokens are stored in the database as SHA-256 hashes. Upon refresh, the presented token is revoked and a new pair is issued (rotation). If a revoked token is presented, the system treats it as potential reuse and blocks the request.
+
+---
+
+## Project Structure
 
 ```text
 high-performance-order-api/
 ├── prisma/
-│   ├── migrations/              # Prisma migration history
-│   │   └── 20261001174629_init/ # Baseline database schema migration
-│   ├── schema.prisma            # Prisma schema models, enums, indexes, and relations
-│   └── seed.ts                  # Database seeding script with realistic demo data
+│   ├── migrations/              # Database migration SQL history
+│   ├── schema.prisma            # Prisma schema models, indexes, and relations
+│   ├── seed.ts                  # Standard development seed data
+│   └── seed.perf.ts             # High-volume performance benchmark seed
 ├── src/
+│   ├── app.ts                   # Express application setup & middleware assembly
+│   ├── server.ts                # HTTP API server entry point & graceful shutdown
+│   ├── worker.ts                # BullMQ worker process entry point & graceful shutdown
 │   ├── config/
-│   │   ├── env.ts               # Environment configuration with Zod runtime validation
-│   │   └── prisma.ts            # Singleton PrismaClient instance with PostgreSQL adapter
+│   │   ├── env.ts               # Environment configuration with Zod validation
+│   │   ├── prisma.ts            # Singleton PrismaClient with PostgreSQL adapter
+│   │   └── swagger.ts           # Swagger/OpenAPI 3.0 JSDoc specification
 │   ├── common/
-│   │   ├── errors/              # Centralized application errors and ErrorCode enum
-│   │   │   └── app.error.ts
-│   │   ├── middleware/          # Global Express middleware
-│   │   │   ├── error.middleware.ts
-│   │   │   ├── not-found.middleware.ts
-│   │   │   ├── request-logger.middleware.ts
-│   │   │   └── validate.middleware.ts # Zod request validation middleware
-│   │   ├── logger/              # Pino structured logger configuration
-│   │   │   └── logger.ts
-│   │   └── types/               # Shared pagination and API response interfaces
-│   │       └── pagination.ts
-│   ├── modules/                 # Modular domain features
-│   │   ├── health/              # Health check module
-│   │   │   ├── health.controller.ts
-│   │   │   └── health.route.ts
-│   │   ├── auth/                # Authentication & Authorization module
-│   │   │   ├── auth.controller.ts
-│   │   │   ├── auth.middleware.ts
-│   │   │   ├── auth.repository.ts
-│   │   │   ├── auth.route.ts
-│   │   │   ├── auth.service.ts
-│   │   │   ├── auth.types.ts
-│   │   │   ├── auth.utils.ts
-│   │   │   └── auth.validation.ts
-│   │   ├── categories/          # Category management module
-│   │   │   ├── category.controller.ts
-│   │   │   ├── category.repository.ts
-│   │   │   ├── category.route.ts
-│   │   │   ├── category.service.ts
-│   │   │   └── category.validation.ts
-│   │   ├── products/            # Product catalog & inventory module
-│   │   │   ├── product.controller.ts
-│   │   │   ├── product.repository.ts
-│   │   │   ├── product.route.ts
-│   │   │   ├── product.service.ts
-│   │   │   └── product.validation.ts
-│   │   ├── inventory/           # Inventory & stock tracking module
-│   │   │   ├── inventory.controller.ts
-│   │   │   ├── inventory.repository.ts
-│   │   │   ├── inventory.route.ts
-│   │   │   ├── inventory.service.ts
-│   │   │   └── inventory.validation.ts
-│   │   ├── orders/              # Order creation, reservation & concurrency module
-│   │   │   ├── order.controller.ts
-│   │   │   ├── order.repository.ts
-│   │   │   ├── order.route.ts
-│   │   │   ├── order.service.ts
-│   │   │   ├── order.types.ts
-│   │   │   └── order.validation.ts
-│   │   └── idempotency/         # Header validation, hashing & idempotency repository
-│   │       ├── idempotency.repository.ts
-│   │       ├── idempotency.service.ts
-│   │       ├── idempotency.types.ts
-│   │       └── idempotency.utils.ts
-│   ├── types/                   # TypeScript ambient declarations (Express.Request augmentation)
-│   │   └── express.d.ts
-│   ├── jobs/                    # BullMQ job workers and consumers (for future phases)
-│   ├── queues/                  # BullMQ queue producers and definitions (for future phases)
-│   ├── events/                  # Domain events and pub/sub handlers (for future phases)
-│   ├── app.ts                   # Express application setup
-│   └── server.ts                # Server startup and graceful termination
+│   │   ├── cache/               # Cache key builders and withCache stampede helper
+│   │   ├── errors/              # Centralized application errors and AppError hierarchy
+│   │   ├── logger/              # Pino structured logger singleton
+│   │   ├── middleware/          # Request logger, error handler, rate limiters, auth guards
+│   │   ├── types/               # Shared pagination, response, and user token types
+│   │   └── utils/               # Currency decimal formatting, sorting, and pagination helpers
+│   ├── infrastructure/
+│   │   └── redis/               # ioredis client, RedisService, distributed lock helpers
+│   ├── jobs/
+│   │   └── order.jobs.ts        # Order event payload interfaces and types
+│   ├── queues/
+│   │   ├── queue.constants.ts   # Queue names, event types, and default retry options
+│   │   ├── queue.factory.ts     # BullMQ queue instances and connection management
+│   │   └── queues.ts            # Producer helper functions (enqueueOrderCreated, etc.)
+│   ├── workers/
+│   │   ├── notification.service.ts # Notification handler implementation
+│   │   └── notification.worker.ts  # BullMQ worker runner with ProcessedJob idempotency
+│   └── modules/
+│       ├── auth/                # Authentication, token rotation, RBAC, user profile
+│       ├── categories/          # Category CRUD, pagination, caching
+│       ├── health/              # Liveness (/health) and readiness (/health/ready) probes
+│       ├── inventory/           # Stock levels, adjustments, movement audit ledger
+│       ├── orders/              # Order placement, locking, cancellation, history
+│       ├── products/            # Product catalog, search, filtering, soft-delete
+│       └── reports/             # Administrative financial and order metrics
 ├── tests/                       # Automated test suites (Jest + Supertest)
-│   ├── auth.test.ts             # Authentication, RBAC & IDOR tests
-│   ├── category.test.ts         # Category API integration tests
-│   ├── health.test.ts           # Health & 404 integration tests
-│   ├── idempotency.test.ts      # Idempotency & Replay integration tests
-│   ├── inventory.test.ts        # Inventory & Concurrency integration tests
-│   ├── order.test.ts            # Order Creation & Concurrency integration tests
-│   ├── product.test.ts          # Product API integration tests
-│   └── helpers/                 # Test auth and setup helpers
-│       └── auth.helper.ts
-├── .env                         # Local environment configuration
-├── .env.example                 # Template for required environment variables
-├── .gitignore                   # Ignored files and directories for Git
-├── eslint.config.js             # Modern ESLint Flat Configuration
-├── prettier.config.js           # Prettier code formatting rules
-├── package.json                 # Project dependencies and npm scripts
-├── prisma.config.ts             # Prisma 7 CLI and datasource configuration
-├── tsconfig.json                # TypeScript compiler configuration (strict mode)
+│   ├── auth.test.ts             # Authentication, token rotation, RBAC, IDOR tests
+│   ├── cache.test.ts            # Redis caching, invalidation, and fallback tests
+│   ├── category.test.ts         # Category endpoints, pagination, validation
+│   ├── health.test.ts           # Health & readiness probes, 404 handler
+│   ├── idempotency.test.ts      # Replay, hash conflicts, concurrency, rollback tests
+│   ├── inventory.test.ts        # Stock adjustments, negative stock rejection, locks
+│   ├── order.test.ts            # Order creation, row locking, race conditions
+│   ├── order-lifecycle.test.ts  # State machine, cancellation, stock release, race safety
+│   ├── phase11-query.test.ts    # Search, filtering, indexing, and report aggregates
+│   ├── product.test.ts          # Product catalog CRUD, price boundary filtering, soft delete
+│   ├── security.test.ts         # Security headers, parameter tampering, SQL injection
+│   └── unit/                    # Unit tests for pure domain and business logic
+├── docker-compose.yml           # Multi-container orchestration (postgres, redis, api, worker)
+├── Dockerfile                   # Multi-stage production container build
+├── .dockerignore                # Excluded build artifacts and local secrets
+├── .env.example                 # Documented environment variable template
+├── package.json                 # Dependencies and npm script targets
+├── tsconfig.json                # TypeScript compiler configuration
 └── README.md                    # Project documentation
 ```
 
 ---
 
-## Category API
+## Database Design & Indexing
 
-Base path: `/api/v1/categories`
-
-| Method   | Endpoint                 | Description                                         | Status Code   |
-| :------- | :----------------------- | :-------------------------------------------------- | :------------ |
-| `POST`   | `/api/v1/categories`     | Create a new category                               | `201 Created` |
-| `GET`    | `/api/v1/categories`     | List categories with search & pagination            | `200 OK`      |
-| `GET`    | `/api/v1/categories/:id` | Get category details by ID                          | `200 OK`      |
-| `PATCH`  | `/api/v1/categories/:id` | Partially update category details                   | `200 OK`      |
-| `DELETE` | `/api/v1/categories/:id` | Delete category (rejected if products are assigned) | `200 OK`      |
-
----
-
-## Product API
-
-Base path: `/api/v1/products`
-
-| Method   | Endpoint               | Description                                                        | Status Code   |
-| :------- | :--------------------- | :----------------------------------------------------------------- | :------------ |
-| `POST`   | `/api/v1/products`     | Create a product with linked inventory record                      | `201 Created` |
-| `GET`    | `/api/v1/products`     | List products with filtering, search, sorting & pagination         | `200 OK`      |
-| `GET`    | `/api/v1/products/:id` | Get product details with category                                  | `200 OK`      |
-| `PATCH`  | `/api/v1/products/:id` | Partially update product details                                   | `200 OK`      |
-| `DELETE` | `/api/v1/products/:id` | Safe product deletion (soft delete if historical references exist) | `200 OK`      |
-
----
-
-## Inventory Management API
-
-Base path: `/api/v1/inventory`
-
-| Method | Endpoint                                 | Description                                                    | Status Code |
-| :----- | :--------------------------------------- | :------------------------------------------------------------- | :---------- |
-| `GET`  | `/api/v1/inventory/:productId`           | Retrieve stock levels & computed available quantity            | `200 OK`    |
-| `POST` | `/api/v1/inventory/:productId/adjust`    | Perform transaction-safe stock adjustment with row locking     | `200 OK`    |
-| `GET`  | `/api/v1/inventory/:productId/movements` | Query paginated movement audit ledger with type & date filters | `200 OK`    |
-
-### Stock Levels & Available Quantity Calculation
-
-The inventory module maintains physical reality in the database:
-
-$$\text{availableQuantity} = \text{quantity} - \text{reservedQuantity}$$
-
-- `quantity`: Physical stock currently located in the warehouse.
-- `reservedQuantity`: Stock earmarked for pending checkout sessions (cannot be consumed or sold).
-- `availableQuantity`: Dynamically computed on read. It is not stored as a separate column to avoid state desynchronization and race conditions.
-
-**Get Inventory Response:**
-
-```json
-{
-  "success": true,
-  "data": {
-    "productId": "ee13d707-3121-4870-adaf-8171443ac14b",
-    "quantity": 100,
-    "reservedQuantity": 20,
-    "availableQuantity": 80
-  }
-}
-```
-
-### Stock Adjustment Types
-
-Manual stock adjustments are performed via `POST /api/v1/inventory/:productId/adjust`:
-
-```json
-{
-  "quantity": 25,
-  "type": "STOCK_IN",
-  "reason": "Supplier shipment batch #401"
-}
-```
-
-1. **`STOCK_IN`:**
-   - Increases physical stock: $\text{newQuantity} = \text{currentQuantity} + \text{quantity}$.
-   - Creates an `InventoryMovement` of type `STOCK_IN`.
-2. **`STOCK_OUT`:**
-   - Decreases physical stock: $\text{newQuantity} = \text{currentQuantity} - \text{quantity}$.
-   - **Invariable Rule:** Manual stock-out cannot consume reserved stock ($\text{quantity} \le \text{availableQuantity}$). If $\text{quantity} > \text{availableQuantity}$, the operation is rejected with `409 INSUFFICIENT_STOCK`.
-   - Physical quantity can never drop below zero.
-3. **`ADJUSTMENT` (Cycle Count / Physical Audit):**
-   - Sets the new absolute physical quantity on hand to the provided `quantity`.
-   - **Invariable Rule:** $\text{newQuantity} \ge \text{reservedQuantity}$. If an adjustment attempts to reduce total physical stock below the currently active reservations, the transaction fails with `409 INVENTORY_BELOW_RESERVED_STOCK`.
-   - Creates an `InventoryMovement` of type `ADJUSTMENT` recording the delta.
-
----
-
-### Concurrency & Row-Level Locking (`SELECT ... FOR UPDATE`)
-
-To prevent race conditions, lost updates, and overselling during high-concurrency order bursts, stock modifications execute inside an atomic database transaction using PostgreSQL row-level locks:
+The schema models an enterprise order-processing engine with strict referential integrity:
 
 ```text
-Incoming Request
-      ↓
-BEGIN TRANSACTION
-      ↓
-SELECT * FROM "inventories" WHERE "productId" = $1 FOR UPDATE
-      ↓  (Concurrent transactions for the same product BLOCK and WAIT here)
-Read latest committed state
-      ↓
-Validate stock availability (quantity >= 0, quantity - reserved >= requested)
-      ↓
-UPDATE "inventories" SET quantity = $newQuantity, version = version + 1
-      ↓
-INSERT INTO "inventory_movements" (...)
-      ↓
-COMMIT (Row lock released; next waiting transaction acquires lock and sees fresh state)
+ ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+ │    User      │──────<│ RefreshToken │       │   Category   │
+ └──────┬───────┘       └──────────────┘       └──────┬───────┘
+        │ 1:1                                         │ 1:N
+        ▼                                             ▼
+ ┌──────────────┐                              ┌──────────────┐
+ │   Customer   │──────┐                       │   Product    │
+ └──────┬───────┘      │                       └──────┬───────┘
+        │ 1:N          │ 1:N                          │ 1:1
+        ▼              ▼                              ▼
+ ┌──────────────┐ ┌──────────────┐             ┌──────────────┐
+ │    Order     │ │IdempotencyKey│             │  Inventory   │
+ └──────┬───────┘ └──────────────┘             └──────┬───────┘
+        │ 1:N                                         │ 1:N
+        ├──────────────────────┬──────────────────────┤
+        ▼                      ▼                      ▼
+ ┌──────────────┐       ┌──────────────┐       ┌─────────────────┐
+ │  OrderItem   │       │StockReservat.│       │InventoryMovement│
+ └──────────────┘       └──────────────┘       └─────────────────┘
+        │ 1:N
+        ▼
+ ┌──────────────────┐
+ │OrderStatusHistory│
+ └──────────────────┘
 ```
 
-#### Why `FOR UPDATE` is Essential:
+### Specialized Indexing Strategy
 
-Without row locking, two simultaneous requests reading stock at $10$ could both approve a stock-out of $7$, resulting in $-4$ (negative stock) or a lost update where one write overwrites the other. With `FOR UPDATE`, PostgreSQL forces serial execution per product, guaranteeing that only the first request succeeds ($10 \to 3$), and the second request immediately encounters $\text{available} = 3 < 7$ and fails cleanly with `409 INSUFFICIENT_STOCK`.
+1. **Trigram GIN Indexes (`pg_trgm`):**
+   - Applied to `products(name)`, `products(sku)`, and `orders(orderNumber)`.
+   - Enables fast `ILIKE '%term%'` substring searches backed by index scans instead of sequential table scans.
+2. **Composite B-Tree Indexes for Access Paths:**
+   - `orders(customerId, createdAt, id)`: Serves customer order history with pagination and deterministic sorting.
+   - `orders(status, createdAt, id)`: Serves administrative order status filtering with total tiebreaker ordering.
+   - `orders(createdAt, id)`: Serves global administrative order lists and date-range reporting aggregations.
+   - `products(categoryId, createdAt, id)`: Serves category browsing with default "newest first" ordering.
+   - `stock_reservations(orderId, status)`: Accelerates order cancellation sweeps looking for `status = 'ACTIVE'`.
+   - `inventory_movements(productId, createdAt)`: Supports product movement audit trail queries.
+   - `order_status_history(orderId, changedAt)`: Serves chronological order status history with zero runtime sort nodes.
+3. **Unique Constraints:**
+   - `idempotency_keys(customerId, key)`: Guarantees customer-scoped idempotency key uniqueness.
+   - `refresh_tokens(tokenHash)`: Guarantees one active session record per token.
+   - `processed_jobs(eventId, eventType)`: Prevents duplicate background worker execution.
 
 ---
 
-### Immutable Audit Trail (`InventoryMovement`)
+## Concurrency & Overselling Prevention
 
-Every stock modification creates an immutable ledger entry recording:
+### The Overselling Problem
 
-- `productId`: Reference to product catalog.
-- `type`: Movement classification (`STOCK_IN`, `STOCK_OUT`, `RESERVATION`, `RELEASE`, `ADJUSTMENT`).
-- `quantity`: Delta of units affected.
-- `referenceType`: Context tag (e.g. `MANUAL_ADJUSTMENT`, `INITIAL_STOCK`, `ORDER`).
-- `referenceId`: Optional reason or external reference.
-- `createdAt`: Microsecond-precision timestamp.
+In high-concurrency environments, naive stock checks fail due to race conditions:
 
----
+1. Request A and Request B both read Product X stock: quantity = 10, reserved = 8, which means available = 2.
+2. Both requests want 2 units (2 <= 2).
+3. Without locking, both approve checkout and update reserved = 8 + 2 = 10.
+4. The combined reservation becomes 12 against a physical quantity of 10. The stock is oversold.
 
-## Order API & Concurrency Control
+### Solution: Row-Level Locking (`SELECT ... FOR UPDATE`)
 
-Base path: `/api/v1/orders`
-
-| Method | Endpoint         | Description                                                | Status Code   |
-| :----- | :--------------- | :--------------------------------------------------------- | :------------ |
-| `POST` | `/api/v1/orders` | Create order, lock rows, reserve stock & log audit history | `201 Created` |
-
-### Request Format
-
-```json
-{
-  "customerId": "8f3e2b1a-9876-4321-bcde-1234567890ab",
-  "items": [
-    {
-      "productId": "ee13d707-3121-4870-adaf-8171443ac14b",
-      "quantity": 2
-    },
-    {
-      "productId": "9cbedf09-5dc5-41f6-8564-3c342d1f9a28",
-      "quantity": 1
-    }
-  ]
-}
-```
-
-### Response Format (`201 Created`)
-
-```json
-{
-  "success": true,
-  "data": {
-    "id": "e45bf90a-1234-4567-89ab-cdef01234567",
-    "orderNumber": "ORD-20261002-7F3A9D1B",
-    "status": "PENDING",
-    "totalAmount": "259.98",
-    "items": [
-      {
-        "productId": "ee13d707-3121-4870-adaf-8171443ac14b",
-        "quantity": 2,
-        "unitPrice": "100.00",
-        "totalPrice": "200.00"
-      },
-      {
-        "productId": "9cbedf09-5dc5-41f6-8564-3c342d1f9a28",
-        "quantity": 1,
-        "unitPrice": "59.98",
-        "totalPrice": "59.98"
-      }
-    ]
-  }
-}
-```
-
----
-
-### Order Creation Flow
+Our implementation serializes access per inventory row inside an atomic PostgreSQL transaction:
 
 ```text
-Request (customerId, items)
-   ↓
-Validate Payload (Zod schema: UUID format, non-empty array, quantity > 0)
-   ↓
-Normalize Items (Merge duplicate product IDs by summing quantities)
-   ↓
-Sort Product IDs Ascending (Global Lock Ordering / Deadlock Prevention)
-   ↓
+Client Request
+      │
+      ▼
 BEGIN TRANSACTION
-   │
-   ├── Step 1: Validate customer exists (404 CUSTOMER_NOT_FOUND)
-   │
-   ├── Step 2: Validate products exist and are active (404 PRODUCT_NOT_FOUND)
-   │
-   ├── Step 3: Lock inventory rows deterministically (SELECT ... FOR UPDATE)
-   │
-   ├── Step 4: Check available stock (available = quantity - reservedQuantity)
-   │           └── If requested > available: Abort & Rollback (409 INSUFFICIENT_STOCK)
-   │
-   ├── Step 5: Compute historical prices & order totals (Arbitrary-precision Decimals)
-   │
-   ├── Step 6: Create Order (status: PENDING, unique orderNumber)
-   │
-   ├── Step 7: Create OrderItems (freezing unitPrice at order creation time)
-   │
-   ├── Step 8: Update Inventory (reservedQuantity += requestedQuantity)
-   │
-   ├── Step 9: Create StockReservations (status: ACTIVE, expiresAt configured)
-   │
-   ├── Step 10: Create InventoryMovements (type: RESERVATION, referenceType: ORDER)
-   │
-   ├── Step 11: Create OrderStatusHistory (fromStatus: null, toStatus: PENDING)
-   │
-   └── COMMIT TRANSACTION
+      │
+      ▼
+Lock Order Row (during cancellation or status update)
+      │
+      ▼
+Sort Product IDs Alphabetically: [P-001, P-002, P-003]
+      │
+      ▼
+SELECT * FROM inventories WHERE productId IN ($1, $2, $3)
+ORDER BY productId FOR UPDATE
+      │  (Concurrent requests for overlapping products wait here)
+      ▼
+Evaluate Stock Availability:
+  availableQuantity = quantity - reservedQuantity
+  IF requestedQuantity > availableQuantity:
+      ROLLBACK TRANSACTION (Throw 409 INSUFFICIENT_STOCK)
+      │
+      ▼ (All items available)
+Increment reservedQuantity by requested amounts
+      │
+      ▼
+INSERT INTO stock_reservations (...)
+INSERT INTO inventory_movements (type: 'RESERVATION', ...)
+INSERT INTO orders (...)
+INSERT INTO order_items (...)
+INSERT INTO order_status_history (toStatus: 'PENDING', ...)
+INSERT INTO idempotency_keys (...)
+      │
+      ▼
+COMMIT TRANSACTION (Row locks released; next queued transaction sees updated stock)
 ```
 
----
+### Deterministic Lock Ordering & Deadlock Reduction
 
-### Architecture & Concurrency Design Deep-Dive
+When orders contain multiple items, concurrent transactions locking items in random order cause cyclic deadlocks:
 
-#### 1. Why `FOR UPDATE`?
+- **Tx 1:** Holds lock on Product A -> requests lock on Product B.
+- **Tx 2:** Holds lock on Product B -> requests lock on Product A.
+- Both transactions block permanently until PostgreSQL detects the deadlock and aborts one.
 
-Without pessimistic row locking, simultaneous requests experience classic **lost updates** and **read-skew anomalies**:
-
-1. Client A and Client B both read Product X stock with $\text{available} = 5$.
-2. Client A requests 4 units; Client B requests 4 units.
-3. Both pass the application availability check ($4 \le 5$).
-4. Both commit, pushing $\text{reservedQuantity} = 8$ against physical stock of $5$ (causing negative available stock $-3$ and overselling).
-
-Executing `SELECT ... FOR UPDATE` acquires an exclusive row-level lock on the `inventories` record. Competing transactions requesting the same row are forced to queue at the database level until the holding transaction commits or rolls back. When a queued transaction is granted the lock, it immediately reads the freshly committed stock values, reliably evaluating stock reality.
-
-#### 2. Why ONE Transaction?
-
-Order placement touches six related tables: `orders`, `order_items`, `inventories`, `stock_reservations`, `inventory_movements`, and `order_status_history`. Wrapping these operations in a single atomic PostgreSQL transaction ensures **Atomicity and Consistency (ACID)**. If any precondition fails (e.g. one item out of five lacks stock, or a database constraint fails), the entire transaction rolls back. No partial orders, unreserved items, orphan ledger entries, or phantom inventory locks are left behind.
-
-#### 3. Why Deterministic Lock Ordering?
-
-When multi-item orders lock rows dynamically in user-supplied request order, **deadlocks** are inevitable under concurrent load:
-
-- **Transaction 1:** Locks Product A $\to$ attempts to lock Product B.
-- **Transaction 2:** Locks Product B $\to$ attempts to lock Product A.
-- Both transactions block waiting for the other to release its lock, forming a cyclic dependency. PostgreSQL terminates one transaction with a `40P01 (deadlock_detected)` error.
-
-By sorting all `productId`s alphabetically (ascending) before acquiring any row locks, all transactions acquire locks in the identical order ($A \to B \to C$). The wait-for graph is strictly directed and acyclic ($DAG$), mathematically eliminating deadlocks.
-
-#### 4. Why Reservation Instead of Reducing Physical Quantity?
-
-Physical quantity ($\text{quantity}$) reflects actual items stored in the warehouse bin. When an order is placed, goods are not yet picked or shipped; they are merely held while checkout completes.
-
-- Decreasing physical stock immediately leads to discrepancies during warehouse cycle counts and physical audits.
-- By isolating $\text{reservedQuantity}$, available stock is dynamically derived ($\text{availableQuantity} = \text{quantity} - \text{reservedQuantity}$).
-- If an order expires, cancels, or fails payment, the reservation is released ($\text{reservedQuantity} -= \text{held}$) without touching physical warehouse ledger counts. When the order is eventually packed and fulfilled, physical quantity is decremented alongside reservation consumption.
-
-#### 5. How Does the System Prevent Overselling?
-
-Overselling prevention is guaranteed by the combination of:
-
-1. **Pessimistic serialization:** `SELECT ... FOR UPDATE` serializes access per inventory row.
-2. **Fresh evaluated state:** Stock availability ($\text{quantity} - \text{reservedQuantity} \ge \text{requested}$) is verified after the lock is acquired.
-3. **Database check constraints:** Enforced non-negative boundaries in PostgreSQL ensure `reservedQuantity` can never exceed `quantity`.
-4. **All-or-nothing rollback:** If any item fails, zero inventory is claimed.
-
-#### 6. What Happens When One Product Has Insufficient Stock?
-
-In a multi-product order (e.g., ordering 2 units of Product A and 1000 units of Product B):
-
-1. Product A is locked and validated (available).
-2. Product B is locked; availability check detects insufficient stock.
-3. An `InsufficientStockError (409)` is thrown.
-4. Prisma aborts the transaction and issues an immediate `ROLLBACK` to PostgreSQL.
-5. All acquired row locks on Product A and Product B are released.
-6. Neither Product A nor Product B has its `reservedQuantity` incremented; no order records, items, reservations, or audit movements are committed.
+**Mitigation:** `mergeAndSortOrderItems()` consolidates duplicate line items and sorts all `productId` values in ascending lexicographical order prior to acquiring any locks. Because every transaction acquires row locks in the exact same sequence (A -> B -> C), cyclic wait-for dependencies are prevented at the application level, significantly reducing deadlock risk.
 
 ---
 
 ## Idempotency & Safe Request Retries
 
-The order creation endpoint is protected by database-enforced idempotency to prevent duplicate orders caused by client retries, network timeouts, or double clicks.
-
-### Why Idempotency?
-
-In distributed network systems, network connections can drop after the server has processed an order but before the client receives the response. Without idempotency, client retries or automatic network resends would create duplicate orders and multiple stock reservations.
-
-### How It Works
+Order creation is protected by customer-scoped idempotency:
 
 ```text
-Client Request (with Idempotency-Key header)
-  ↓
-Validate Header (non-empty string, max 255 chars)
-  ↓
-Compute Canonical Request Hash (SHA-256 of customerId and normalized items)
-  ↓
-Check Existing Key (customerId + key)
-  ├── Existing + Same Hash: Return cached original response (201 Created)
-  ├── Existing + Different Hash: Reject with 409 IDEMPOTENCY_KEY_REUSED
-  └── New / Expired:
-       ↓
-  Begin PostgreSQL Transaction
-       ↓
-  Validate Customer
-       ↓
-  Claim Idempotency Key (INSERT into idempotency_keys)
-       ↓
-  Lock Inventory (SELECT ... FOR UPDATE)
-       ↓
-  Validate Stock Availability
-       ↓
-  Create Order & OrderItems
-       ↓
-  Create StockReservations & Movements
-       ↓
-  Store Response in Idempotency Record (responseStatus, responseBody)
-       ↓
-  COMMIT
-       ↓
-  Return Order Response
+Request: POST /api/v1/orders
+Header: Idempotency-Key: <unique-client-key>
+Body: { "items": [...] }
 ```
 
-### Same Key + Same Request (Replay)
+### Processing Flow
 
-When the client retries with the same `Idempotency-Key` and an identical or semantically equivalent payload (e.g. rearranged items or unmerged duplicates that resolve to the same canonical structure), the server returns the cached response with the original HTTP status (`201 Created`). No duplicate orders or additional stock reservations are created.
+1. **Header Validation:** The key must be a non-empty string (max 255 chars).
+2. **Canonical Payload Hashing:** Computes a SHA-256 hash of the authenticated customer ID and normalized, sorted items.
+3. **Fast-Path Check:** Queries existing idempotency records for `(customerId, key)`:
+   - **Same Key + Same Hash:** Returns the cached original response (`201 Created`). No duplicate order or stock reservation is created.
+   - **Same Key + Different Hash:** Throws `409 IDEMPOTENCY_KEY_REUSED` to prevent accidental key collisions with differing payloads.
+4. **Transactional Insertion:** If the key is fresh, it is inserted into `idempotency_keys` inside the order transaction.
+5. **Concurrent Duplicate Requests:** If two identical requests hit the server concurrently, PostgreSQL's `@@unique([customerId, key])` constraint blocks the second transaction. Upon the first transaction committing, the second encounters error `P2002`, catches it, polls for the committed record, and returns the stored `201` response.
+6. **No Poisoned Keys:** If order placement fails due to business validation (e.g. `INSUFFICIENT_STOCK`), the transaction issues an immediate `ROLLBACK`, discarding the uncommitted idempotency key. The client can retry with the same key once inventory is replenished.
 
-### Same Key + Different Request (409 Conflict)
+---
 
-If a client attempts to reuse an existing `Idempotency-Key` with a different payload (e.g. altered quantity or different product IDs), the request is rejected with `409 Conflict` and code `IDEMPOTENCY_KEY_REUSED`. This prevents accidental collisions and misuse.
+## Caching & Stampede Mitigation
 
-### Concurrent Duplicate Requests (Unique Constraint Synchronization)
+Read-heavy endpoints implement a Redis cache-aside pattern to reduce PostgreSQL query load:
 
-When multiple concurrent requests arrive with the exact same `(customerId, key)` at the exact same millisecond:
+```text
+Client GET Request
+       │
+       ▼
+Check Redis Cache
+ ├── Cache HIT  ──► Deserialize JSON & Return Response (PostgreSQL bypassed)
+ └── Cache MISS
+       │
+       ▼
+Try Acquire Mutex Lock (SET lock:key token EX 5 NX)
+ ├── Lock ACQUIRED:
+ │     1. Query PostgreSQL
+ │     2. Write to Redis with TTL (default: 300s)
+ │     3. Release Lock via Lua script (safe compare-and-delete)
+ │     4. Return Data
+ └── Lock NOT Acquired:
+       Fallback: Fetch directly from PostgreSQL without blocking
+```
 
-1. Both attempt to insert into `idempotency_keys` inside their respective transactions.
-2. PostgreSQL's unique constraint (`@@unique([customerId, key])`) serializes the transactions: the first transaction claims the row; subsequent transactions pause and block on the unique index lock.
-3. When the first transaction commits with the completed response, the waiting transactions unblock and encounter a unique constraint violation (`P2002`).
-4. The waiting transactions catch the conflict, query the committed response, verify the request hash, and return the exact same `201 Created` response.
-5. Exactly one order is created in the database.
+### Invalidation Strategy
 
-### Failed Transactions (No Poisoned Keys)
+Mutating operations explicitly invalidate affected cache keys via Redis `SCAN` matching:
 
-If an order fails (e.g. `INSUFFICIENT_STOCK` or validation failure):
+- Category creation, update, or deletion invalidates `categories:*`.
+- Product creation, update, or deletion invalidates `products:*`.
+- Stock adjustments invalidate `products:*` and inventory views.
 
-1. The transaction issues an immediate `ROLLBACK`.
-2. The tentative `IdempotencyKey` record is rolled back alongside the rest of the transaction.
-3. The key is not poisoned. The client is free to retry with the same key once the underlying issue is resolved.
+### Redis Resilience
 
-### Key Expiration (TTL)
+If the Redis connection drops or fails, all cache and lock operations catch the exception, log a warning, and fall back to PostgreSQL transparently. The API remains fully functional during Redis outages.
 
-- Idempotency keys have a configurable Time-To-Live (`IDEMPOTENCY_KEY_TTL_HOURS`, default: `24` hours).
-- Expired keys encountered during request evaluation are automatically removed and treated as fresh keys.
+---
+
+## Background Processing & Queue Architecture
+
+Non-critical side effects are processed asynchronously using BullMQ and Redis:
+
+```text
+API Server                                            Worker Process
+┌──────────────────────────────┐                      ┌──────────────────────────────┐
+│ Order Transaction Commits    │                      │ BullMQ Worker                │
+│             │                │                      │ (concurrency: 5)             │
+│             ▼                │                      │              │               │
+│ Enqueue Event to BullMQ      │                      │              ▼               │
+│ (Queue: 'order-events')      │───► Redis Queue ────►│ Check ProcessedJob Table     │
+│  - ORDER_CREATED             │                      │ (eventId, eventType unique)  │
+│  - ORDER_CANCELLED           │                      │  - If duplicate: skip        │
+│  - ORDER_CONFIRMED           │                      │  - If new: insert & process  │
+│  - ORDER_SHIPPED             │                      │              │               │
+└──────────────────────────────┘                      │              ▼               │
+                                                      │ Send Notification / Email    │
+                                                      └──────────────────────────────┘
+```
+
+### Worker Configuration
+
+- **Queue Name:** `order-events` (configurable via `QUEUE_PREFIX`).
+- **Concurrency:** 5 concurrent jobs per worker instance (`WORKER_CONCURRENCY`).
+- **Retry Strategy:** 3 attempts with exponential backoff (initial delay: 1,000ms -> 2,000ms -> 4,000ms).
+- **Job Retention:** Retains 100 completed jobs and 500 failed jobs for administrative inspection.
+- **Worker-Side Idempotency:** The worker records `(eventId, eventType)` in the `processed_jobs` table under a unique constraint. If a job is delivered more than once (at-least-once delivery), subsequent attempts are skipped without duplicate side effects.
+- **Graceful Shutdown:** On `SIGTERM` / `SIGINT`, the worker finishes active jobs, closes BullMQ connections, disconnects Prisma, and exits cleanly.
 
 ---
 
 ## Authentication & Authorization
 
-Phase 7 implements production-grade stateless JWT authentication, database-persisted refresh token rotation with reuse detection, Role-Based Access Control (RBAC), and Customer Ownership Protection (IDOR prevention).
+### Token Architecture
 
-### Core Token Architecture
+- **Access Token:** Stateless JWT, signed with `JWT_ACCESS_SECRET`, 15-minute lifetime (`JWT_ACCESS_EXPIRES_IN=15m`). Contains `userId` and `role`.
+- **Refresh Token:** Cryptographically random string, signed with `JWT_REFRESH_SECRET`, 7-day lifetime (`JWT_REFRESH_EXPIRES_IN=7d`). Stored in PostgreSQL as a SHA-256 hash (`refresh_tokens.tokenHash`).
 
-1. **Access Token:**
-   - Short-lived (15 minutes by default: `JWT_ACCESS_EXPIRES_IN=15m`).
-   - Compact, stateless JWT payload:
-     ```json
-     {
-       "sub": "user-id",
-       "role": "CUSTOMER",
-       "type": "access"
-     }
-     ```
-   - Passed via the standard HTTP header: `Authorization: Bearer <access-token>`.
-   - Verified by `authenticate` middleware without database lookups for high-throughput performance.
+### Refresh Token Rotation & Revocation
 
-2. **Refresh Token:**
-   - Long-lived (7 days by default: `JWT_REFRESH_EXPIRES_IN=7d`).
-   - Cryptographically random unique token ID (`tokenId` UUID v4):
-     ```json
-     {
-       "sub": "user-id",
-       "tokenId": "550e8400-e29b-41d4-a716-446655440000",
-       "type": "refresh"
-     }
-     ```
-   - **Database Hashing:** Plaintext refresh tokens are **never stored** in the database. Only a deterministic SHA-256 hash (`crypto.createHash('sha256').update(token).digest('hex')`) is persisted in the `refresh_tokens` table. Even if the database is leaked, raw refresh tokens cannot be used to forge sessions.
+1. When a client requests `POST /api/v1/auth/refresh`, the server verifies the JWT and validates the hash in `refresh_tokens`.
+2. The current refresh token is revoked (`revokedAt = new Date()`).
+3. A new access token and refresh token pair is issued and persisted.
+4. If an already-revoked refresh token is presented, the server rejects it with `401 REVOKED_REFRESH_TOKEN`, mitigating token theft replay.
+5. `POST /api/v1/auth/logout` explicitly revokes the presented refresh token.
 
-3. **Refresh Token Rotation & Reuse Detection:**
-   - Each invocation of `POST /api/v1/auth/refresh` immediately revokes the consumed refresh token and issues a newly generated token pair.
-   - If an attacker or client attempts to replay a revoked refresh token, the server detects the reuse and immediately halts execution with `401 REVOKED_REFRESH_TOKEN`.
+### Role-Based Access Control (RBAC) & IDOR Protection
 
-4. **Logout & Revocation:**
-   - `POST /api/v1/auth/logout` takes `{ refreshToken }` and stamps `revokedAt = now()` on the corresponding record in PostgreSQL.
+- **Roles:** `CUSTOMER` and `ADMIN`.
+- **Customer Identity Derivation:** When creating an order (`POST /api/v1/orders`), any client-supplied `customerId` in the body is discarded. The customer is derived strictly from `req.user.id`.
+- **Insecure Direct Object Reference (IDOR) Safeguards:** Customers can only inspect or cancel their own orders (`order.customerId === customer.id`). Attempting to access another customer's order returns `403 ORDER_ACCESS_DENIED`. Administrators can inspect and cancel any order.
 
 ---
 
-### Authentication Flow
+## Order Lifecycle & Status Management
 
-```text
-[ Client ]                     [ Express / Middleware ]                [ PostgreSQL ]
-    |                                     |                                   |
-    |--- POST /api/v1/auth/login -------->|                                   |
-    |    { email, password }              |--- Verify bcrypt password ------->|
-    |                                     |--- Store SHA-256 tokenHash ------>|
-    |<-- { accessToken, refreshToken } ---|                                   |
-    |                                     |                                   |
-    |--- Request + Bearer <accessToken> ->| (Verified locally via JWT Secret) |
-    |<-- 200 OK Response -----------------|                                   |
-    |                                     |                                   |
-    |--- Access Token Expires ------------|                                   |
-    |--- POST /api/v1/auth/refresh ------>|                                   |
-    |    { refreshToken }                 |--- Check not revoked & not exp -->|
-    |                                     |--- Atomic Rotation (Revoke+New) ->|
-    |<-- { newAccess, newRefresh } -------|                                   |
-    |                                     |                                   |
-    |--- POST /api/v1/auth/logout ------->|--- Mark revokedAt = now() ------->|
-    |<-- 200 Logged out successfully -----|                                   |
-```
-
----
-
-### Authorization & RBAC Matrix
-
-| Endpoint                                 | Method   | Required Role     | Description                                                      |
-| :--------------------------------------- | :------- | :---------------- | :--------------------------------------------------------------- |
-| `/health`                                | `GET`    | **Public**        | Liveness check                                                   |
-| `/api/v1/auth/register`                  | `POST`   | **Public**        | Customer user & profile registration                             |
-| `/api/v1/auth/login`                     | `POST`   | **Public**        | Issues Access + Refresh token pair                               |
-| `/api/v1/auth/refresh`                   | `POST`   | **Public**        | Rotates refresh token and issues new tokens                      |
-| `/api/v1/auth/logout`                    | `POST`   | **Authenticated** | Revokes current refresh session                                  |
-| `/api/v1/auth/me`                        | `GET`    | **Authenticated** | Returns authenticated user & customer profile                    |
-| `/api/v1/categories`                     | `GET`    | **Public**        | List & filter categories                                         |
-| `/api/v1/categories/:id`                 | `GET`    | **Public**        | Get category by ID                                               |
-| `/api/v1/categories`                     | `POST`   | **ADMIN**         | Create new category                                              |
-| `/api/v1/categories/:id`                 | `PATCH`  | **ADMIN**         | Update category                                                  |
-| `/api/v1/categories/:id`                 | `DELETE` | **ADMIN**         | Delete category                                                  |
-| `/api/v1/products`                       | `GET`    | **Public**        | List, filter, search, sort products                              |
-| `/api/v1/products/:id`                   | `GET`    | **Public**        | Get product by ID                                                |
-| `/api/v1/products`                       | `POST`   | **ADMIN**         | Create product + initialize inventory                            |
-| `/api/v1/products/:id`                   | `PATCH`  | **ADMIN**         | Update product                                                   |
-| `/api/v1/products/:id`                   | `DELETE` | **ADMIN**         | Delete product                                                   |
-| `/api/v1/inventory/:productId`           | `GET`    | **ADMIN**         | View physical and available stock                                |
-| `/api/v1/inventory/:productId/adjust`    | `POST`   | **ADMIN**         | Stock in/out or manual count adjustment                          |
-| `/api/v1/inventory/:productId/movements` | `GET`    | **ADMIN**         | Audit ledger of inventory movements                              |
-| `/api/v1/orders`                         | `POST`   | **Authenticated** | Creates order with stock reservation                             |
-| `/api/v1/orders/:orderId/cancel`         | `POST`   | **Authenticated** | Cancels order & releases reserved stock (Customer owns or Admin) |
-| `/api/v1/orders/:orderId/status`         | `PATCH`  | **ADMIN**         | Updates order status with lifecycle validation                   |
-| `/api/v1/orders/:orderId/history`        | `GET`    | **Authenticated** | Chronological audit trail (Customer owns or Admin)               |
-| `/api/v1/orders/:id`                     | `GET`    | **Authenticated** | View order details (enforces customer ownership)                 |
-
----
-
-### Customer Ownership Protection & IDOR Prevention
-
-1. **Server-Side Customer Identity Derivation:**
-   - Clients **never control `customerId`** during order creation (`POST /api/v1/orders`).
-   - Even if a malicious client sends `customerId: "other-customer-uuid"`, the controller completely discards it and resolves the customer strictly via `req.user.id` from the verified JWT.
-2. **Order Access Control (`GET /api/v1/orders/:id`):**
-   - If accessed by a `CUSTOMER`, the service enforces `order.customerId === authenticatedCustomer.id`.
-   - Access attempts across customer boundaries are denied with `403 ORDER_ACCESS_DENIED`.
-   - Users with the `ADMIN` role can inspect any customer order.
-3. **Customer-Scoped Idempotency:**
-   - Idempotency is enforced by the unique constraint `(customerId, key)`. A key used by Customer A is isolated from Customer B, preventing cross-tenant replay or replay collision.
-
----
-
-### Security Decisions & Best Practices
-
-- **Argon2 / Bcrypt Hashing:** Passwords hashed using bcrypt (10 rounds). Passwords and password hashes are never returned in responses and never printed to log streams.
-- **Constant-Time Comparison:** When non-existent emails attempt login, a dummy hash comparison is performed to defeat user enumeration timing attacks.
-- **No Plaintext Refresh Tokens in Database:** Database breach resistance is guaranteed by storing only SHA-256 digests.
-- **Separation of Token Secrets:** Access tokens and Refresh tokens use independent signing secrets (`JWT_ACCESS_SECRET` vs `JWT_REFRESH_SECRET`) and different lifetimes.
-- **Type Enforcement:** Refresh tokens cannot be presented as access tokens (`type === 'access'` check) and vice-versa.
-
----
-
-## Phase 8: Order Cancellation & Status Management
-
-### 1. Centralized Order Lifecycle State Machine
-
-The order status transitions are strictly governed by a centralized domain transition matrix (`canTransitionOrderStatus`):
+Orders transition through a deterministic lifecycle enforced by a centralized domain transition matrix (`canTransitionOrderStatus`):
 
 ```text
        PENDING
@@ -643,441 +495,450 @@ The order status transitions are strictly governed by a centralized domain trans
        └───► [None] (Terminal)
 ```
 
-#### Allowed & Forbidden Transitions
+### Transition Rules
 
-| Current Status | Target Status | Permitted? | Notes                                |
-| :------------- | :------------ | :--------- | :----------------------------------- |
-| `PENDING`      | `CONFIRMED`   | **Yes**    | Standard progression                 |
-| `PENDING`      | `CANCELLED`   | **Yes**    | Stock reservation released           |
-| `CONFIRMED`    | `PROCESSING`  | **Yes**    | Fulfillment begins                   |
-| `CONFIRMED`    | `CANCELLED`   | **Yes**    | Stock reservation released           |
-| `PROCESSING`   | `SHIPPED`     | **Yes**    | Carrier handover                     |
-| `SHIPPED`      | `DELIVERED`   | **Yes**    | Final successful delivery            |
-| `PROCESSING`   | `CANCELLED`   | **No**     | 422 `ORDER_CANCELLATION_NOT_ALLOWED` |
-| `SHIPPED`      | `CANCELLED`   | **No**     | 422 `ORDER_CANCELLATION_NOT_ALLOWED` |
-| `DELIVERED`    | `CANCELLED`   | **No**     | 422 `ORDER_CANCELLATION_NOT_ALLOWED` |
-| `CANCELLED`    | _Any_         | **No**     | Terminal state; 409 or 422           |
-| `DELIVERED`    | _Any_         | **No**     | Terminal state; 422                  |
+- **Allowed Cancellations:** Orders can be cancelled **only** from `PENDING` or `CONFIRMED` status.
+- **Forbidden Cancellations:** Attempting to cancel orders in `PROCESSING`, `SHIPPED`, or `DELIVERED` status is rejected with `422 ORDER_CANCELLATION_NOT_ALLOWED`.
+- **Terminal States:** `CANCELLED` and `DELIVERED` cannot transition to any other status.
+- **Status Auditing:** Every status change inserts an immutable record into `order_status_history` recording `fromStatus`, `toStatus`, `changedBy`, `reason`, and timestamp.
 
 ---
 
-### 2. Endpoints Specification
+## API Documentation (Swagger / OpenAPI)
 
-#### A. Cancel Order API
+Interactive API documentation is generated via `swagger-jsdoc` and rendered through Swagger UI.
 
-```http
-POST /api/v1/orders/:orderId/cancel
-Authorization: Bearer <accessToken>
-Content-Type: application/json
-
-{
-  "reason": "Customer requested cancellation"
-}
-```
-
-- **Authentication:** Required (Bearer Access Token).
-- **Role Requirements:**
-  - `CUSTOMER`: Can only cancel their own order (`order.customerId === customer.id` derived from JWT; verified against IDOR).
-  - `ADMIN`: Can cancel any customer's eligible order.
-- **Eligible Statuses:** `PENDING` or `CONFIRMED`.
-- **Response (`200 OK`):**
-
-```json
-{
-  "success": true,
-  "data": {
-    "id": "f762de15-bdc1-45e8-a8aa-2da107e05224",
-    "orderNumber": "ORD-20261001-A1B2C3D4",
-    "status": "CANCELLED",
-    "totalAmount": "100.00",
-    "items": [
-      {
-        "productId": "product-uuid",
-        "quantity": 2,
-        "unitPrice": "50.00",
-        "totalPrice": "100.00"
-      }
-    ]
-  }
-}
-```
-
-- **Possible Errors:**
-  - `401 UNAUTHENTICATED`: Missing or invalid token.
-  - `403 ORDER_ACCESS_DENIED`: Customer attempting to cancel another customer's order.
-  - `404 ORDER_NOT_FOUND`: Order ID does not exist.
-  - `409 ORDER_ALREADY_CANCELLED`: Order was already cancelled (safe idempotency guard).
-  - `422 ORDER_CANCELLATION_NOT_ALLOWED`: Order is in `PROCESSING`, `SHIPPED`, or `DELIVERED` status.
-
-#### B. Update Order Status API
-
-```http
-PATCH /api/v1/orders/:orderId/status
-Authorization: Bearer <adminAccessToken>
-Content-Type: application/json
-
-{
-  "status": "CONFIRMED",
-  "reason": "Payment verified"
-}
-```
-
-- **Authentication:** Required (Bearer Access Token).
-- **Role Requirements:** Strictly `ADMIN` only. Customer requests are rejected with `403 FORBIDDEN`.
-- **Cancellation Delegation:** When `status` is `CANCELLED`, automatically delegates to the atomic cancellation and reservation release workflow.
-- **Response (`200 OK`):** Updated `OrderResponseView` object.
-- **Possible Errors:**
-  - `400 VALIDATION_ERROR`: Invalid status enum value.
-  - `401 UNAUTHENTICATED`: Missing or invalid token.
-  - `403 FORBIDDEN`: Non-admin user attempting status modification.
-  - `404 ORDER_NOT_FOUND`: Order ID does not exist.
-  - `422 ORDER_STATUS_TRANSITION_NOT_ALLOWED`: Invalid lifecycle transition.
-
-#### C. Order Status History API
-
-```http
-GET /api/v1/orders/:orderId/history
-Authorization: Bearer <accessToken>
-```
-
-- **Authentication:** Required (Bearer Access Token).
-- **Role Requirements:**
-  - `CUSTOMER`: Can view only their own order history.
-  - `ADMIN`: Can view any order's history.
-- **Response (`200 OK`):**
-
-```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "history-uuid-1",
-      "orderId": "order-uuid",
-      "fromStatus": null,
-      "toStatus": "PENDING",
-      "changedBy": null,
-      "reason": "Order created",
-      "createdAt": "2026-10-01T21:00:00.000Z"
-    },
-    {
-      "id": "history-uuid-2",
-      "orderId": "order-uuid",
-      "fromStatus": "PENDING",
-      "toStatus": "CONFIRMED",
-      "changedBy": "admin-uuid",
-      "reason": "Payment verified",
-      "createdAt": "2026-10-01T21:05:00.000Z"
-    }
-  ]
-}
-```
-
----
-
-### 3. Transactional Stock Reservation Release & Concurrency Strategy
-
-Cancellation executes inside **one atomic PostgreSQL transaction**:
+### Local URL
 
 ```text
-Request (POST /orders/:id/cancel)
-   ↓
-Authentication & Authorization Check
-   ↓
-BEGIN TRANSACTION
-   │
-   ├── Step 1: Lock Order Row (SELECT ... FROM orders WHERE id = $1 FOR UPDATE)
-   │           └── Freshly evaluated status prevents race conditions
-   │
-   ├── Step 2: Validate Cancellability (PENDING or CONFIRMED only)
-   │           ├── If CANCELLED: Abort & Rollback (409 ORDER_ALREADY_CANCELLED)
-   │           └── If PROCESSING/SHIPPED/DELIVERED: Abort & Rollback (422 ORDER_CANCELLATION_NOT_ALLOWED)
-   │
-   ├── Step 3: Fetch ACTIVE StockReservations
-   │
-   ├── Step 4: Group Quantities by Product & Sort Alphabetically (Deadlock Prevention)
-   │
-   ├── Step 5: Lock Inventory Rows Deterministically (SELECT ... FROM inventories FOR UPDATE)
-   │
-   ├── Step 6: Decrement reservedQuantity (Physical quantity is strictly UNCHANGED!)
-   │
-   ├── Step 7: Create InventoryMovement (type: RELEASE, referenceType: ORDER, referenceId: orderId)
-   │
-   ├── Step 8: Update StockReservations (status: RELEASED, releasedAt: now())
-   │
-   ├── Step 9: Update Order (status: CANCELLED)
-   │
-   ├── Step 10: Create OrderStatusHistory (fromStatus, toStatus: CANCELLED, changedBy: userId)
-   │
-   └── COMMIT TRANSACTION
+http://localhost:5000/api/docs
 ```
 
-#### Key Architectural Highlights:
-
-1. **Physical Quantity Preservation:** Physical warehouse inventory (`quantity`) was never decremented at order creation time; only `reservedQuantity` was claimed. Therefore, cancellation **only decrements `reservedQuantity`**.
-2. **Deadlock-Free Row Locking:** Just as in Phase 5, all product IDs are sorted lexicographically (`localeCompare`) before acquiring inventory row locks.
-3. **Double-Cancellation Prevention:** If two concurrent cancel requests arrive simultaneously, the first acquires the lock, transitions the order, and commits. The second request, unblocked from `FOR UPDATE`, reads the fresh status `CANCELLED` and rejects safely with `409 ORDER_ALREADY_CANCELLED` without double-releasing stock or duplicating ledger records.
-4. **Cancel vs Confirm Race Protection:** Concurrent Cancel and Confirm requests are serialized by the row-level lock on the order table. If Cancel commits first, Confirm fails with `422 ORDER_STATUS_TRANSITION_NOT_ALLOWED`. If Confirm commits first, Cancel evaluates the new status `CONFIRMED` (which is cancellable) and cleanly releases stock. The database always concludes in a consistent state.
+Swagger UI provides:
+- Complete endpoint listings organized by tags (`Auth`, `Categories`, `Products`, `Inventory`, `Orders`, `Reports`).
+- Interactive "Try it out" test consoles for every endpoint.
+- Request payload schemas, parameter descriptions, and type constraints.
+- Response structures and error definitions (`ErrorResponse`).
+- Bearer JWT authentication header configuration.
 
 ---
 
-### 4. Database Index Architecture Review
+## API Endpoints
 
-The database indexes directly support high-throughput order processing and audit reporting:
+### Authentication (`/api/v1/auth`)
 
-| Model                | Index Field(s) | Primary Purpose / Performance Rationale                                           |
-| :------------------- | :------------- | :-------------------------------------------------------------------------------- |
-| `Order`              | `[customerId]` | Essential for B-Tree lookup of customer orders and IDOR ownership checks.         |
-| `Order`              | `[status]`     | Speeds up filtering orders by lifecycle state across admin consoles.              |
-| `Order`              | `[createdAt]`  | Supports high-performance chronological sorting on customer and admin dashboards. |
-| `OrderStatusHistory` | `[orderId]`    | Eliminates sequential table scans when loading order audit trails (`/history`).   |
-| `OrderStatusHistory` | `[changedAt]`  | Guarantees ordered history extraction without expensive in-memory sorts.          |
-| `StockReservation`   | `[orderId]`    | Fast retrieval of reservations associated with an order during cancellation.      |
-| `StockReservation`   | `[status]`     | Speeds up querying `ACTIVE` reservations for release and expiration cleanup.      |
-| `StockReservation`   | `[expiresAt]`  | Optimized for background worker sweeper queries targeting expired reservations.   |
-| `InventoryMovement`  | `[productId]`  | Instant retrieval of inventory movement ledger for a given product.               |
-| `InventoryMovement`  | `[createdAt]`  | Fast time-window filtering (`from`/`to`) for stock movement reconciliation.       |
+| Method | Path | Auth | Roles | Description | Status |
+|---|---|---|---|---|---|
+| `POST` | `/api/v1/auth/register` | None | Public | Register new customer account | `201 Created` |
+| `POST` | `/api/v1/auth/login` | None | Public | Login with email & password | `200 OK` |
+| `POST` | `/api/v1/auth/refresh` | None | Public | Refresh access token using refresh token | `200 OK` |
+| `POST` | `/api/v1/auth/logout` | Bearer | All | Revoke active refresh token | `200 OK` |
+| `GET` | `/api/v1/auth/me` | Bearer | All | Get profile of authenticated user | `200 OK` |
+
+### Categories (`/api/v1/categories`)
+
+| Method | Path | Auth | Roles | Description | Status |
+|---|---|---|---|---|---|
+| `GET` | `/api/v1/categories` | None | Public | List categories with search, sorting, pagination | `200 OK` |
+| `GET` | `/api/v1/categories/:id` | None | Public | Get single category by UUID | `200 OK` |
+| `POST` | `/api/v1/categories` | Bearer | `ADMIN` | Create a new category | `201 Created` |
+| `PATCH` | `/api/v1/categories/:id` | Bearer | `ADMIN` | Update category details | `200 OK` |
+| `DELETE` | `/api/v1/categories/:id` | Bearer | `ADMIN` | Delete category (rejected if products exist) | `200 OK` |
+
+### Products (`/api/v1/products`)
+
+| Method | Path | Auth | Roles | Description | Status |
+|---|---|---|---|---|---|
+| `GET` | `/api/v1/products` | None | Public | Search & filter products (trigram GIN indexed) | `200 OK` |
+| `GET` | `/api/v1/products/:id` | None | Public | Get product details by UUID | `200 OK` |
+| `POST` | `/api/v1/products` | Bearer | `ADMIN` | Create product with linked inventory | `201 Created` |
+| `PATCH` | `/api/v1/products/:id` | Bearer | `ADMIN` | Update product details | `200 OK` |
+| `DELETE` | `/api/v1/products/:id` | Bearer | `ADMIN` | Soft-delete product if order history exists | `200 OK` |
+
+### Inventory (`/api/v1/inventory`)
+
+| Method | Path | Auth | Roles | Description | Status |
+|---|---|---|---|---|---|
+| `GET` | `/api/v1/inventory/:productId` | Bearer | `ADMIN` | Get physical, reserved, and available stock | `200 OK` |
+| `POST` | `/api/v1/inventory/:productId/adjust` | Bearer | `ADMIN` | Adjust stock (`STOCK_IN`, `STOCK_OUT`, `ADJUSTMENT`) | `200 OK` |
+| `GET` | `/api/v1/inventory/:productId/movements` | Bearer | `ADMIN` | View paginated inventory movement audit trail | `200 OK` |
+
+### Orders (`/api/v1/orders`)
+
+| Method | Path | Auth | Roles | Description | Status |
+|---|---|---|---|---|---|
+| `GET` | `/api/v1/orders` | Bearer | All | List orders (customer: own; admin: all + filters) | `200 OK` |
+| `POST` | `/api/v1/orders` | Bearer | All | Idempotent transactional order creation | `201 Created` / `200 OK` |
+| `GET` | `/api/v1/orders/:orderId` | Bearer | All | Get order details with items and status | `200 OK` |
+| `POST` | `/api/v1/orders/:orderId/cancel` | Bearer | All | Cancel eligible order & release reservations | `200 OK` |
+| `PATCH` | `/api/v1/orders/:orderId/status` | Bearer | `ADMIN` | Update status via domain state machine | `200 OK` |
+| `GET` | `/api/v1/orders/:orderId/history` | Bearer | All | View chronological order status audit trail | `200 OK` |
+
+### Reports (`/api/v1/reports` — Admin Only)
+
+| Method | Path | Auth | Roles | Description | Status |
+|---|---|---|---|---|---|
+| `GET` | `/api/v1/reports/orders/status-summary` | Bearer | `ADMIN` | Order count breakdown by status | `200 OK` |
+| `GET` | `/api/v1/reports/orders` | Bearer | `ADMIN` | Order count, total revenue, average order value | `200 OK` |
+| `GET` | `/api/v1/reports/revenue` | Bearer | `ADMIN` | Revenue time series grouped by day or month | `200 OK` |
+| `GET` | `/api/v1/reports/products` | Bearer | `ADMIN` | Top-selling products ranked by units sold & revenue | `200 OK` |
+
+### Health & Readiness (`/health`)
+
+| Method | Path | Auth | Roles | Description | Status |
+|---|---|---|---|---|---|
+| `GET` | `/health` | None | Public | Liveness probe (HTTP server alive) | `200 OK` |
+| `GET` | `/health/ready` | None | Public | Readiness probe (probes PostgreSQL & Redis) | `200 OK` / `503 Service Unavailable` |
 
 ---
 
 ## Error Handling Standards
 
-All errors return uniform JSON responses:
+All API responses follow a consistent JSON format:
+
+### Standard Error Response
 
 ```json
 {
   "success": false,
   "error": {
     "code": "INSUFFICIENT_STOCK",
-    "message": "Insufficient stock for product Wireless Headphones"
+    "message": "Insufficient stock for product Wireless Noise-Cancelling Headphones Pro"
   }
 }
 ```
 
-### Domain Error Codes Reference
+### Validation Error Response (`400 Bad Request`)
 
-| HTTP Status          | Error Code                            | Trigger Condition                                                                         |
-| :------------------- | :------------------------------------ | :---------------------------------------------------------------------------------------- |
-| `400 Bad Request`    | `VALIDATION_ERROR`                    | Schema validation failed (e.g. quantity $\le 0$, invalid UUID).                           |
-| `400 Bad Request`    | `INVALID_ORDER_STATUS`                | Provided status value is not part of the `OrderStatus` enum.                              |
-| `400 Bad Request`    | `IDEMPOTENCY_KEY_REQUIRED`            | Missing or empty `Idempotency-Key` header.                                                |
-| `400 Bad Request`    | `INVALID_IDEMPOTENCY_KEY`             | `Idempotency-Key` exceeds 255 characters or is invalid type.                              |
-| `400 Bad Request`    | `INVALID_CATEGORY`                    | `categoryId` provided on product creation does not exist.                                 |
-| `400 Bad Request`    | `INVALID_ORDER`                       | Malformed order data.                                                                     |
-| `401 Unauthorized`   | `UNAUTHENTICATED`                     | Missing or malformed `Authorization` header.                                              |
-| `401 Unauthorized`   | `INVALID_CREDENTIALS`                 | Incorrect email or password during login.                                                 |
-| `401 Unauthorized`   | `INVALID_ACCESS_TOKEN`                | Access token signature invalid or invalid token type.                                     |
-| `401 Unauthorized`   | `ACCESS_TOKEN_EXPIRED`                | Access token expiration timestamp has elapsed.                                            |
-| `401 Unauthorized`   | `INVALID_REFRESH_TOKEN`               | Refresh token invalid or malformed.                                                       |
-| `401 Unauthorized`   | `REFRESH_TOKEN_EXPIRED`               | Refresh token expiration timestamp has elapsed.                                           |
-| `401 Unauthorized`   | `REVOKED_REFRESH_TOKEN`               | Reused or revoked refresh token presented.                                                |
-| `403 Forbidden`      | `FORBIDDEN`                           | Insufficient role permissions (e.g. `CUSTOMER` accessing `ADMIN` endpoint).               |
-| `403 Forbidden`      | `ORDER_ACCESS_DENIED`                 | Customer attempting to access or cancel another customer's order (IDOR).                  |
-| `404 Not Found`      | `USER_NOT_FOUND`                      | User account does not exist.                                                              |
-| `404 Not Found`      | `PRODUCT_NOT_FOUND`                   | Product ID does not exist in database.                                                    |
-| `404 Not Found`      | `CUSTOMER_NOT_FOUND`                  | Customer profile does not exist in database.                                              |
-| `404 Not Found`      | `CATEGORY_NOT_FOUND`                  | Category ID does not exist.                                                               |
-| `404 Not Found`      | `INVENTORY_NOT_FOUND`                 | Product exists but has no inventory record.                                               |
-| `404 Not Found`      | `ORDER_NOT_FOUND`                     | Order ID does not exist.                                                                  |
-| `404 Not Found`      | `STOCK_RESERVATION_NOT_FOUND`         | No active stock reservation found for the specified order.                                |
-| `409 Conflict`       | `EMAIL_ALREADY_EXISTS`                | Email address is already registered.                                                      |
-| `409 Conflict`       | `IDEMPOTENCY_KEY_REUSED`              | Idempotency key reused with a different request payload.                                  |
-| `409 Conflict`       | `INSUFFICIENT_STOCK`                  | Requested quantity exceeds available stock ($\text{quantity} - \text{reservedQuantity}$). |
-| `409 Conflict`       | `INVENTORY_BELOW_RESERVED_STOCK`      | Target adjustment is lower than current `reservedQuantity`.                               |
-| `409 Conflict`       | `ORDER_ALREADY_CANCELLED`             | Order has already been cancelled; prevents redundant stock release.                       |
-| `409 Conflict`       | `DUPLICATE_CATEGORY`                  | Category name or slug already in use.                                                     |
-| `409 Conflict`       | `DUPLICATE_PRODUCT`                   | Product slug already in use.                                                              |
-| `409 Conflict`       | `DUPLICATE_SKU`                       | Product SKU already in use.                                                               |
-| `409 Conflict`       | `CATEGORY_HAS_PRODUCTS`               | Attempted deletion of category with assigned products.                                    |
-| `422 Unprocessable`  | `ORDER_CANCELLATION_NOT_ALLOWED`      | Order is in non-cancellable state (`PROCESSING`, `SHIPPED`, `DELIVERED`).                 |
-| `422 Unprocessable`  | `ORDER_STATUS_TRANSITION_NOT_ALLOWED` | Requested status transition violates the state machine matrix.                            |
-| `500 Internal Error` | `ORDER_CREATION_FAILED`               | Internal error while processing order creation.                                           |
-| `500 Internal Error` | `INTERNAL_SERVER_ERROR`               | Uncaught system exception.                                                                |
+```json
+{
+  "success": false,
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Validation failed",
+    "details": [
+      {
+        "field": "items.0.quantity",
+        "message": "Quantity must be greater than 0"
+      }
+    ]
+  }
+}
+```
+
+### Error Code Reference
+
+| HTTP Status | Error Code | Description |
+|---|---|---|
+| `400 Bad Request` | `VALIDATION_ERROR` | Schema validation failed on body, query, or params. |
+| `401 Unauthorized` | `UNAUTHENTICATED` | Missing or malformed Bearer authorization token. |
+| `401 Unauthorized` | `INVALID_CREDENTIALS` | Invalid email address or password. |
+| `401 Unauthorized` | `INVALID_ACCESS_TOKEN` | Token signature is invalid or expired. |
+| `401 Unauthorized` | `ACCESS_TOKEN_EXPIRED` | Access token has passed its expiration time. |
+| `401 Unauthorized` | `INVALID_REFRESH_TOKEN` | Refresh token is malformed, unrecognized, or forged. |
+| `401 Unauthorized` | `REFRESH_TOKEN_EXPIRED` | Refresh token has passed its 7-day expiration time. |
+| `401 Unauthorized` | `REVOKED_REFRESH_TOKEN` | Presented refresh token was previously revoked. |
+| `403 Forbidden` | `FORBIDDEN` | Authenticated role lacks permission for the endpoint. |
+| `403 Forbidden` | `ORDER_ACCESS_DENIED` | Customer attempting to access or cancel another customer's order. |
+| `404 Not Found` | `RESOURCE_NOT_FOUND` | Unmatched route or endpoint. |
+| `404 Not Found` | `USER_NOT_FOUND` | User account does not exist. |
+| `404 Not Found` | `CUSTOMER_NOT_FOUND` | Customer profile does not exist for the authenticated user. |
+| `404 Not Found` | `PRODUCT_NOT_FOUND` | Product ID does not exist in catalog. |
+| `404 Not Found` | `CATEGORY_NOT_FOUND` | Category ID does not exist. |
+| `404 Not Found` | `INVENTORY_NOT_FOUND` | Inventory record missing for product. |
+| `404 Not Found` | `ORDER_NOT_FOUND` | Order ID does not exist. |
+| `404 Not Found` | `STOCK_RESERVATION_NOT_FOUND` | No active stock reservation found for cancellation. |
+| `409 Conflict` | `EMAIL_ALREADY_EXISTS` | Email address is already registered. |
+| `409 Conflict` | `DUPLICATE_CATEGORY` | Category name or slug already in use. |
+| `409 Conflict` | `DUPLICATE_PRODUCT` | Product slug already in use. |
+| `409 Conflict` | `DUPLICATE_SKU` | Product SKU already in use. |
+| `409 Conflict` | `CATEGORY_HAS_PRODUCTS` | Cannot delete category with assigned products. |
+| `409 Conflict` | `IDEMPOTENCY_KEY_REUSED` | Idempotency key reused with a different request payload. |
+| `409 Conflict` | `INSUFFICIENT_STOCK` | Requested quantity exceeds available stock (quantity - reservedQuantity). |
+| `409 Conflict` | `INVENTORY_BELOW_RESERVED_STOCK` | Manual adjustment cannot drop physical stock below active reservations. |
+| `409 Conflict` | `ORDER_ALREADY_CANCELLED` | Order has already been cancelled. |
+| `422 Unprocessable` | `ORDER_CANCELLATION_NOT_ALLOWED` | Order is in non-cancellable state (`PROCESSING`, `SHIPPED`, `DELIVERED`). |
+| `422 Unprocessable` | `ORDER_STATUS_TRANSITION_NOT_ALLOWED` | Requested transition violates the state machine matrix. |
+| `429 Too Many Requests` | `TOO_MANY_REQUESTS` | Rate limit threshold exceeded. |
+| `500 Internal Error` | `INTERNAL_SERVER_ERROR` | Uncaught exception. Stack traces are suppressed in production. |
 
 ---
 
-## Local Development & Testing
+## Testing & Verification
 
-### Run Tests
+The project includes an automated test suite executed via Jest and Supertest against a live PostgreSQL test database:
 
 ```bash
+# Run unit and API tests
 npm test
+
+# Run integration test suites
+npm run test:integration
+
+# Run all test suites
+npm run test:all
+
+# Run concurrency test suites sequentially
+npm run test:concurrency
+
+# Run test coverage analysis
+npm run test:coverage
 ```
 
-- **116 automated integration and concurrency tests** across Health, Auth, Category, Product, Inventory, Order, Idempotency, and Order Lifecycle suites.
-- Includes real concurrent race condition verification under PostgreSQL row-level locking, cancellation idempotency, cancel vs confirm race safety, token rotation tests, and IDOR customer ownership verification.
+### Test Suite Structure
 
-### Start Development Server
+The test suite contains **184 automated tests across 12 test suites**:
+
+1. `tests/auth.test.ts` (28 tests): User registration, credential verification, access token validation, refresh token rotation, revocation, RBAC role enforcement, and IDOR protection.
+2. `tests/cache.test.ts` (25 tests): Redis cache-aside hits and misses, SCAN pattern invalidation on mutations, double-checked stampede protection, and transparent fallback during Redis outages.
+3. `tests/category.test.ts` (14 tests): Category creation, slug uniqueness, pagination, search, updates, and deletion constraint checks.
+4. `tests/health.test.ts` (5 tests): Liveness `/health`, readiness `/health/ready` probing PostgreSQL and Redis, and structured 404 handler responses.
+5. `tests/idempotency.test.ts` (15 tests): Idempotent replays (`201`), hash mismatch conflict detection (`409`), concurrent duplicate deduplication via database unique constraints, and transaction rollback recovery without poisoned keys.
+6. `tests/inventory.test.ts` (16 tests): Stock level retrieval, `STOCK_IN` and `STOCK_OUT` calculations, negative stock rejection, and movement audit ledgers.
+7. `tests/order.test.ts` (14 tests): Transactional order creation, inventory reservation, row-level locking verification, and overselling prevention.
+8. `tests/order-lifecycle.test.ts` (22 tests): Centralized state machine transitions, cancellation permission rules, reservation release, and concurrent cancel vs confirm race safety.
+9. `tests/phase11-query.test.ts` (15 tests): Trigram GIN full-text search, date-range and amount filtering, composite index queries, and financial report aggregations.
+10. `tests/product.test.ts` (18 tests): Product catalog CRUD, price boundary filtering, inventory linkage, and soft-delete safeguards.
+11. `tests/security.test.ts` (10 tests): Helmet security headers, SQL injection resistance, malformed body rejection, and UUID validation.
+12. `tests/unit/business-logic.test.ts` (2 tests): Unit testing for pure calculation functions and state transition rules.
+
+### Code Quality Commands
 
 ```bash
-npm run dev
-```
-
-### Code Quality & Build Checks
-
-```bash
+# Type check TypeScript without emitting files
 npx tsc --noEmit
+
+# Run ESLint analysis
 npm run lint
+
+# Check formatting with Prettier
 npm run format:check
+
+# Compile production JavaScript build
 npm run build
 ```
 
 ---
 
-## Phase 13 � Docker & Production Runtime
+## Local Development Setup
+
+### Prerequisites
+
+- **Node.js:** v22.x or later
+- **PostgreSQL:** v16.x or later
+- **Redis:** v7.x or later
+- **npm:** v10.x or later
+
+### Setup Steps
+
+1. **Clone the repository and install dependencies:**
+
+   ```bash
+   git clone <repository-url>
+   cd high-performance-order-api
+   npm install
+   ```
+
+2. **Configure environment variables:**
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Update `DATABASE_URL` and `REDIS_URL` in `.env` to point to your local PostgreSQL and Redis instances.
+
+3. **Run database migrations:**
+
+   ```bash
+   npx prisma generate
+   npx prisma migrate dev
+   ```
+
+4. **Seed the database with sample data:**
+
+   ```bash
+   npm run db:seed
+   ```
+
+5. **Start the API server (development mode with hot-reloading):**
+
+   ```bash
+   npm run dev
+   ```
+
+   The API server starts on `http://localhost:5000`.
+
+6. **Start the BullMQ background worker (in a separate terminal):**
+
+   ```bash
+   npm run worker
+   ```
+
+7. **Access the API documentation:**
+
+   Open `http://localhost:5000/api/docs` in your browser.
+
+---
+
+## Docker & Production Runtime
+
+The project includes production containerization orchestrated via Docker Compose.
 
 ### Quick Start (Docker Compose)
 
 ```bash
-# Build images and start all services
+# Build production images and start all 4 services
 docker compose up --build
 
-# Start in detached mode
+# Run in detached mode
 docker compose up -d --build
 
-# Stop containers (data volumes preserved)
+# Stop containers (named data volumes are preserved)
 docker compose down
 
-# Stop AND wipe all data (volumes deleted)
+# Stop and wipe database and cache volumes
 docker compose down -v
 ```
 
-### Services
+### Services Overview
 
-| Service    | Description                          | Port (local) |
-|------------|--------------------------------------|--------------|
-| `postgres`  | PostgreSQL 16                        | 5432         |
-| `redis`     | Redis 7 (cache + BullMQ)            | 6379         |
-| `api`       | Express HTTP API (compiled JS)       | 5000         |
-| `worker`    | BullMQ notification worker (no HTTP) | �            |
+| Service | Container Image | Port (Host:Container) | Healthcheck | Purpose |
+|---|---|---|---|---|
+| `postgres` | `postgres:16-alpine` | `5432:5432` | `pg_isready -U postgres -d order_api` | Relational database with persistent volume |
+| `redis` | `redis:7-alpine` | `6379:6379` | `redis-cli ping` | In-memory cache & BullMQ broker with RDB persistence |
+| `api` | `high-performance-order-api:latest` | `5000:5000` | `wget -qO- http://localhost:5000/health` | Express API server (runs migrations on startup) |
+| `worker` | `high-performance-order-api:latest` | None (background) | Depends on healthy API & Redis | BullMQ background notification worker |
 
-### Architecture
+### Dockerfile Highlights
 
-```text
-Client
-  ?
-API (port 5000)
-  +-- PostgreSQL  ? synchronous, transactional
-  +-- Redis       ? cache, rate limiting, BullMQ
-  +-- Queue (BullMQ)
-            ?
-          Worker  ? asynchronous notifications
-```
+- **Multi-Stage Build:**
+  - `deps`: Installs full dependencies (`npm ci`) needed for build tools.
+  - `build`: Runs `npx prisma generate` and `npm run build` (`tsc`).
+  - `production`: Installs only production dependencies (`npm ci --omit=dev`), copies compiled `dist/`, and uses `node:22-alpine`.
+- **Security:** Runs as a non-root `nodejs` user (UID 1001). Excludes `.env`, tests, and development tooling.
+- **Process Management:** Uses `dumb-init` as PID 1 to ensure proper signal forwarding (`SIGTERM`/`SIGINT`) and prevent zombie process leaks.
 
-#### Synchronous (critical path � must not fail silently)
-- Order creation & idempotency
-- Inventory reservation & stock locking
-- Order cancellation & stock release
-- Status transitions
+### Graceful Shutdown Sequence
 
-#### Asynchronous (non-critical � worker processes in background)
-- Order event notifications (ORDER_CREATED, ORDER_CANCELLED, etc.)
-- Other background side effects
+Both the API and worker implement graceful termination:
 
-### Health & Readiness
+**API Server:**
+1. Stops accepting new incoming HTTP connections (`server.close()`).
+2. Awaits completion of in-flight requests.
+3. Closes BullMQ queue producer connections.
+4. Closes Redis connections.
+5. Disconnects Prisma PostgreSQL client.
+6. Exits with code 0 (15-second timeout safety net).
+
+**Worker Process:**
+1. Pauses BullMQ worker to prevent claiming new jobs.
+2. Awaits completion of currently running jobs (`worker.close()`).
+3. Closes queue connections.
+4. Disconnects Prisma client.
+5. Exits with code 0.
+
+---
+
+## Environment Variables
+
+| Variable | Required | Default (Dev) | Description |
+|---|---|---|---|
+| `NODE_ENV` | Yes | `development` | Application runtime environment (`development`, `test`, `production`) |
+| `PORT` | Yes | `5000` | HTTP port on which Express listens |
+| `DATABASE_URL` | Yes | `postgresql://...` | PostgreSQL connection string (use `postgres` service name in Docker) |
+| `REDIS_URL` | Yes | `redis://localhost:6379` | Redis connection URL (use `redis` service name in Docker) |
+| `CACHE_TTL_SECONDS` | No | `300` | Default cache-aside Time-To-Live in seconds |
+| `QUEUE_PREFIX` | No | `high-performance-order-api` | Prefix for BullMQ Redis queue keys |
+| `WORKER_CONCURRENCY` | No | `5` | Maximum parallel jobs processed by the worker |
+| `JWT_SECRET` | Yes | `change-me` | Legacy secret key fallback |
+| `JWT_ACCESS_SECRET` | Yes | `change-me-access` | Cryptographic secret for signing access tokens (min 32 chars) |
+| `JWT_ACCESS_EXPIRES_IN` | No | `15m` | Lifetime of access tokens (`15m`, `1h`, etc.) |
+| `JWT_REFRESH_SECRET` | Yes | `change-me-refresh` | Cryptographic secret for signing refresh tokens (min 32 chars) |
+| `JWT_REFRESH_EXPIRES_IN` | No | `7d` | Lifetime of refresh tokens (`7d`, `30d`, etc.) |
+| `STOCK_RESERVATION_MINUTES` | No | `30` | Duration before an unfulfilled stock reservation expires |
+| `IDEMPOTENCY_KEY_TTL_HOURS` | No | `24` | Retention period for idempotency records in hours |
+| `TIMEZONE` | No | `UTC` | IANA timezone for report date-range boundary calculations |
+| `PRISMA_LOG_QUERIES` | No | `false` | Enable verbose Prisma SQL query logging (disabled in production) |
+| `RATE_LIMIT_WINDOW_MS` | No | `60000` | Global rate limit window duration in milliseconds (1 minute) |
+| `RATE_LIMIT_MAX_REQUESTS` | No | `100` | Maximum requests allowed per IP within global window |
+| `AUTH_RATE_LIMIT_WINDOW_MS` | No | `60000` | Auth endpoints rate limit window in milliseconds |
+| `AUTH_RATE_LIMIT_MAX_REQUESTS` | No | `10` | Maximum auth requests allowed per IP per minute |
+| `ORDER_RATE_LIMIT_WINDOW_MS` | No | `60000` | Order creation rate limit window in milliseconds |
+| `ORDER_RATE_LIMIT_MAX_REQUESTS` | No | `20` | Maximum order creation requests allowed per customer IP per minute |
+| `CORS_ORIGINS` | No | `http://localhost:3000` | Comma-separated list of allowed CORS origins |
+| `BODY_LIMIT` | No | `1mb` | Maximum allowed request body payload size |
+
+---
+
+## Database Migrations & Seeding
+
+### Migration Strategy
+
+- **Development:** Use `npx prisma migrate dev` to create and apply incremental migration files while developing schema changes.
+- **Production / CI / Docker:** Use `npx prisma migrate deploy` (or `npm run db:migrate`). This applies all pending migrations in an idempotent manner and **never prompts to reset** the database.
+
+### Seeding Scripts
+
+The database seed (`prisma/seed.ts`) populates realistic demonstration records:
+
+- **1 Administrator User:** `admin@orderapi.com` / `AdminPassword123!` (`role: ADMIN`)
+- **1 Customer User & Profile:** `john.doe@example.com` / `CustomerPassword123!` (`role: CUSTOMER`, Name: John Doe)
+- **2 Categories:** `Electronics`, `Home & Kitchen`
+- **4 Products with Initial Stock & Movements:**
+  - `Wireless Noise-Cancelling Headphones Pro` (Stock: 120, Price: $199.99)
+  - `Ergonomic Mechanical Keyboard (Brown Switch)` (Stock: 10, Price: $129.50)
+  - `Digital Smart Air Fryer XL (6.5L)` (Stock: 60, Price: $149.99)
+  - `Compact Espresso Machine 15-Bar` (Stock: 25, Price: $289.00)
+- **2 Demonstration Orders:**
+  - `ORD-SEED-001`: Status `CONFIRMED`
+  - `ORD-SEED-002`: Status `SHIPPED`
+
+Run seed script:
 
 ```bash
-# Liveness check (lightweight � no dependency probes)
-curl http://localhost:5000/health
-
-# Readiness check (probes PostgreSQL + Redis)
-curl http://localhost:5000/health/ready
+npm run db:seed
 ```
 
-### Inspecting Logs
+For performance benchmarks, a separate generator creates 1,000+ products, 10,000+ orders, and 50,000+ items:
 
 ```bash
-docker compose logs -f api
-docker compose logs -f worker
-docker compose ps
+npm run db:seed:perf
 ```
 
-### Database Operations
+---
 
-```bash
-# Run pending migrations (idempotent, production-safe)
-docker compose exec api npx prisma migrate deploy
+## Production Considerations & Architectural Trade-offs
 
-# Seed with sample data (development only)
-docker compose exec api npm run db:seed
+1. **Post-Commit Queue Enqueue vs Transactional Outbox:**
+   - Order domain events are enqueued to BullMQ immediately after `prisma.$transaction` commits.
+   - *Trade-off:* In the rare event that the application process crashes in the few milliseconds between the database commit and the Redis queue write, the order exists in PostgreSQL but the notification event is not enqueued.
+   - *Rationale:* For this system, post-commit enqueueing avoids the operational complexity of an Outbox polling process or Change Data Capture (CDC) engine while guaranteeing that uncommitted or rolled-back orders never generate phantom events.
+2. **Pessimistic Row Locking vs Optimistic Locking:**
+   - The system utilizes pessimistic row locks (`SELECT ... FOR UPDATE`) over optimistic version checking.
+   - *Trade-off:* High contention on a single product serializes transactions and increases queue latency.
+   - *Rationale:* Under flash-sale scenarios where stock drops from 1 to 0, optimistic locking causes widespread transaction retries and rollback thrashing. Pessimistic locking ensures every transaction that obtains the lock makes definitive, reliable progress.
+3. **Redis Fallback Degradation:**
+   - In the event of a Redis outage, cache operations fall back to PostgreSQL and rate limiting degrades to in-memory tracking.
+   - *Trade-off:* Database query load increases during cache outages.
+   - *Rationale:* Preserves business continuity and checkout availability over strict cache dependency.
+4. **Offset-Based Pagination:**
+   - Standard queries utilize `LIMIT` and `OFFSET` with total count calculations.
+   - *Trade-off:* High offsets (e.g. page 5,000) scan and discard rows in PostgreSQL.
+   - *Rationale:* Offset pagination satisfies standard administrative UI requirements and sorting flexibility. For extreme dataset depths, cursor-based pagination is recommended.
 
-# Open Prisma Studio (local dev)
-docker compose exec api npx prisma studio
-```
+---
 
-### Environment Variables
+## Submission Notes
 
-Copy `.env.example` to `.env` and adjust for your environment.
+This project represents a completed backend engineering assessment implementation:
 
-> **? Production**: Replace all `change-me` values with strong secrets before deploying.
-> Use `openssl rand -hex 32` to generate secure secrets.
-
-Key variables:
-
-| Variable | Purpose |
-|---|---|
-| `DATABASE_URL` | PostgreSQL connection string � use service name `postgres` inside Docker |
-| `REDIS_URL` | Redis connection string � use service name `redis` inside Docker |
-| `JWT_ACCESS_SECRET` | Access token signing key (min 32 chars) |
-| `JWT_REFRESH_SECRET` | Refresh token signing key (min 32 chars) |
-| `WORKER_CONCURRENCY` | Number of parallel BullMQ jobs (default: 5) |
-| `CACHE_TTL_SECONDS` | Redis cache TTL in seconds (default: 300) |
-
-### Docker Networking
-
-Services communicate using Compose service names:
-
-```
-postgres:5432   ? database
-redis:6379      ? cache + queue
-```
-
-**Never use `localhost` for inter-container communication** � `localhost` resolves to the container itself.
-
-### Database Migration Strategy
-
-- **Development:** `npx prisma migrate dev` (creates migration files, may prompt for reset)
-- **Production/Docker:** `npx prisma migrate deploy` (applies pending migrations, never resets)
-
-The API container runs `prisma migrate deploy` automatically on startup via the `command` in `docker-compose.yml`.
-
-### Redis Persistence
-
-Redis is configured with RDB snapshot persistence (`--save 60 1`): a snapshot is taken every 60 seconds if at least 1 key changed. This ensures BullMQ jobs survive Redis restarts.
-
-### Dockerfile
-
-Multi-stage build:
-
-```
-deps  ? install all dependencies (dev + prod, for tsc + prisma generate)
-build ? npx prisma generate + npm run build (TypeScript ? JavaScript)
-production ? npm ci --omit=dev, copy dist/, run as non-root nodejs user
-```
-
-The final image:
-- Uses `node:22-alpine` (LTS, minimal footprint)
-- Runs as non-root `nodejs` user (UID 1001)
-- Uses `dumb-init` as PID 1 for proper signal forwarding
-- Ships only production `node_modules`
-- Does NOT contain `.env`, test code, or dev tooling
-
-### Graceful Shutdown
-
-Both the API and worker handle `SIGTERM` / `SIGINT`:
-
-**API shutdown order:**
-1. Stop accepting new HTTP requests
-2. Wait for active requests to complete
-3. Close BullMQ queue connections
-4. Disconnect Redis
-5. Disconnect PostgreSQL (Prisma)
-6. Exit 0
-
-**Worker shutdown order:**
-1. Stop accepting new BullMQ jobs
-2. Wait for in-flight jobs to complete
-3. Close worker connection
-4. Close queue connections
-5. Disconnect PostgreSQL
-6. Exit 0
-
+- [x] Strict concurrency control with zero overselling verified under automated tests.
+- [x] Safe request retries with customer-scoped database idempotency.
+- [x] Complete ACID transaction wrapping order creation, inventory reservations, movements, and status history.
+- [x] Robust cancellation workflow with atomic stock reservation release.
+- [x] Distributed cache-aside caching with stampede protection and pattern invalidation.
+- [x] Decoupled BullMQ event processing with worker idempotency.
+- [x] JWT authentication with refresh token rotation and IDOR protection.
+- [x] Trigram GIN and composite B-tree indexing for query optimization.
+- [x] Complete OpenAPI 3.0 specification served via Swagger UI.
+- [x] Multi-stage Docker containerization with non-root security and healthchecks.
